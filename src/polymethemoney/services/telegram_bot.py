@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import logging
@@ -118,9 +118,9 @@ class TelegramBotService:
     def _help_text(self) -> str:
         return (
             "[명령어]\n"
-            "/status - 요약 카드\n"
-            "/report60 - 60분 요약\n"
-            "/report6h - 6시간 요약\n"
+            "/status - 상태 요약\n"
+            "/report60 - 최근 60분 요약\n"
+            "/report6h - 최근 6시간 요약\n"
             "/pnl - 손익 요약\n"
             "/positions [N] - 포지션 상세\n"
             "/help - 도움말"
@@ -152,8 +152,8 @@ class TelegramBotService:
             "[상태]\n"
             f"시각 {now}\n"
             f"모드 {mode} | 상태 {status}\n"
-            f"포지션 {pos_total}개 (+{pos_pl['pos']}/0{pos_pl['flat']}/-{pos_pl['neg']}) | 승인대기 {pending_count}건\n"
-            f"{risk_line}\n"
+            f"포지션 {pos_total}개(+{pos_pl['pos']}/0{pos_pl['flat']}/-{pos_pl['neg']}) | 승인대기 {pending_count}건\n"
+            f"리스크 {risk_line}\n"
             f"{fill_line}\n"
             f"{reject_line}"
         )
@@ -161,7 +161,7 @@ class TelegramBotService:
     async def _build_report_card(self, window_minutes: int) -> str:
         stats = await self._collect_signal_stats(window_minutes)
         if stats is None:
-            return "[요약]\n데이터 없음"
+            return "[리포트]\n데이터 없음"
 
         signals = stats["signals"]
         fills = stats["fills"]
@@ -173,7 +173,7 @@ class TelegramBotService:
         pnl_line = "손익 N/A" if pnl is None else f"손익 {pnl:+.2f} USD"
 
         return (
-            f"[요약 {window_minutes}m]\n"
+            f"[리포트 {window_minutes}m]\n"
             f"신호 {signals} | 체결 {fills} ({fill_rate:.0%})\n"
             f"{pnl_line}\n"
             f"거절: {top_rejects}"
@@ -209,7 +209,10 @@ class TelegramBotService:
             method = getattr(self.store, name, None)
             if method is None:
                 continue
-            result = method(**kwargs)
+            try:
+                result = method(**kwargs)
+            except TypeError:
+                result = method()
             if asyncio.iscoroutine(result):
                 result = await result
             parsed = self._parse_signal_stats_payload(result)
@@ -227,7 +230,10 @@ class TelegramBotService:
             method = getattr(self.store, name, None)
             if method is None:
                 continue
-            result = method(**kwargs)
+            try:
+                result = method(**kwargs)
+            except TypeError:
+                result = method()
             if asyncio.iscoroutine(result):
                 result = await result
             if isinstance(result, list):
@@ -244,7 +250,10 @@ class TelegramBotService:
             method = getattr(self.store, name, None)
             if method is None:
                 continue
-            result = method(**kwargs)
+            try:
+                result = method(**kwargs)
+            except TypeError:
+                result = method()
             if asyncio.iscoroutine(result):
                 result = await result
             if isinstance(result, list):
@@ -299,7 +308,7 @@ class TelegramBotService:
     def _format_top_rejects(self, rejections: dict[str, Any], top_n: int) -> str:
         if not rejections:
             return "없음"
-        items = []
+        items: list[tuple[str, int]] = []
         for key, val in rejections.items():
             try:
                 count = int(val)
@@ -353,4 +362,7 @@ class TelegramBotService:
     def _should_rewrite_report(self, text: str) -> bool:
         if not text:
             return False
-        return "정기 리포트" in text or "상태 요약" in text or "리포트" in text
+        for key in ("정기 리포트", "상태 요약", "리포트"):
+            if key in text:
+                return True
+        return False
