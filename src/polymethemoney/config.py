@@ -92,27 +92,27 @@ class Settings(BaseSettings):
     auto_tune_min_position_usd: float = Field(default=1.0, alias="AUTO_TUNE_MIN_POSITION_USD")
     auto_tune_apply_once: bool = Field(default=True, alias="AUTO_TUNE_APPLY_ONCE")
     auto_threshold_tune_enabled: bool = Field(default=True, alias="AUTO_THRESHOLD_TUNE_ENABLED")
-    auto_threshold_tune_window_minutes: int = Field(default=180, alias="AUTO_THRESHOLD_TUNE_WINDOW_MINUTES")
-    auto_threshold_tune_min_signals: int = Field(default=20, alias="AUTO_THRESHOLD_TUNE_MIN_SIGNALS")
-    auto_threshold_tune_fillrate_low: float = Field(default=0.15, alias="AUTO_THRESHOLD_TUNE_FILLRATE_LOW")
-    auto_threshold_tune_fillrate_high: float = Field(default=0.45, alias="AUTO_THRESHOLD_TUNE_FILLRATE_HIGH")
-    auto_threshold_tune_step_net_ev: float = Field(default=0.00002, alias="AUTO_THRESHOLD_TUNE_STEP_NET_EV")
+    auto_threshold_tune_window_minutes: int = Field(default=120, alias="AUTO_THRESHOLD_TUNE_WINDOW_MINUTES")
+    auto_threshold_tune_min_signals: int = Field(default=30, alias="AUTO_THRESHOLD_TUNE_MIN_SIGNALS")
+    auto_threshold_tune_fillrate_low: float = Field(default=0.20, alias="AUTO_THRESHOLD_TUNE_FILLRATE_LOW")
+    auto_threshold_tune_fillrate_high: float = Field(default=0.50, alias="AUTO_THRESHOLD_TUNE_FILLRATE_HIGH")
+    auto_threshold_tune_step_net_ev: float = Field(default=0.00001, alias="AUTO_THRESHOLD_TUNE_STEP_NET_EV")
     auto_threshold_tune_step_min_price: float = Field(default=0.0005, alias="AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE")
-    auto_threshold_tune_step_min_usd: float = Field(default=0.5, alias="AUTO_THRESHOLD_TUNE_STEP_MIN_USD")
-    auto_threshold_tune_cooldown_minutes: int = Field(default=60, alias="AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES")
-    auto_threshold_tune_min_net_ev: float = Field(default=0.00004, alias="AUTO_THRESHOLD_TUNE_MIN_NET_EV")
-    auto_threshold_tune_max_net_ev: float = Field(default=0.00020, alias="AUTO_THRESHOLD_TUNE_MAX_NET_EV")
+    auto_threshold_tune_step_min_usd: float = Field(default=0.25, alias="AUTO_THRESHOLD_TUNE_STEP_MIN_USD")
+    auto_threshold_tune_cooldown_minutes: int = Field(default=45, alias="AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES")
+    auto_threshold_tune_min_net_ev: float = Field(default=0.00005, alias="AUTO_THRESHOLD_TUNE_MIN_NET_EV")
+    auto_threshold_tune_max_net_ev: float = Field(default=0.00025, alias="AUTO_THRESHOLD_TUNE_MAX_NET_EV")
     auto_threshold_tune_min_contract_price_min: float = Field(
         default=0.001, alias="AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MIN"
     )
     auto_threshold_tune_min_contract_price_max: float = Field(
-        default=0.010, alias="AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MAX"
+        default=0.020, alias="AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MAX"
     )
     auto_threshold_tune_min_position_usd_min: float = Field(
         default=1.0, alias="AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MIN"
     )
     auto_threshold_tune_min_position_usd_max: float = Field(
-        default=5.0, alias="AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MAX"
+        default=6.0, alias="AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MAX"
     )
     paper_perf_tune_enabled: bool = Field(default=True, alias="PAPER_PERF_TUNE_ENABLED")
     paper_perf_tune_interval_hours: int = Field(default=3, alias="PAPER_PERF_TUNE_INTERVAL_HOURS")
@@ -144,15 +144,15 @@ class Settings(BaseSettings):
     full_retrain_hour_utc: int = Field(default=3, alias="FULL_RETRAIN_HOUR_UTC")
 
     arb_enabled: bool = Field(default=True, alias="ARB_ENABLED")
-    arb_min_net_edge_pct: float = Field(default=0.01, alias="ARB_MIN_NET_EDGE_PCT")
-    arb_max_legs: int = Field(default=20, alias="ARB_MAX_LEGS")
-    arb_exec_window_ms: int = Field(default=1500, alias="ARB_EXEC_WINDOW_MS")
-    arb_early_exit_edge_capture: float = Field(default=0.5, alias="ARB_EARLY_EXIT_EDGE_CAPTURE")
+    arb_min_net_edge_pct: float = Field(default=0.012, alias="ARB_MIN_NET_EDGE_PCT")
+    arb_max_legs: int = Field(default=12, alias="ARB_MAX_LEGS")
+    arb_exec_window_ms: int = Field(default=1200, alias="ARB_EXEC_WINDOW_MS")
+    arb_early_exit_edge_capture: float = Field(default=0.40, alias="ARB_EARLY_EXIT_EDGE_CAPTURE")
     arb_capital_share: float = Field(default=0.5, alias="ARB_CAPITAL_SHARE")
-    arb_fee_buffer_bps: float = Field(default=10.0, alias="ARB_FEE_BUFFER_BPS")
-    arb_slippage_buffer_bps: float = Field(default=15.0, alias="ARB_SLIPPAGE_BUFFER_BPS")
-    arb_scan_interval_seconds: int = Field(default=45, alias="ARB_SCAN_INTERVAL_SECONDS")
-    arb_market_limit: int = Field(default=300, alias="ARB_MARKET_LIMIT")
+    arb_fee_buffer_bps: float = Field(default=12.0, alias="ARB_FEE_BUFFER_BPS")
+    arb_slippage_buffer_bps: float = Field(default=20.0, alias="ARB_SLIPPAGE_BUFFER_BPS")
+    arb_scan_interval_seconds: int = Field(default=30, alias="ARB_SCAN_INTERVAL_SECONDS")
+    arb_market_limit: int = Field(default=200, alias="ARB_MARKET_LIMIT")
 
     gate_paper_days: int = Field(default=3, alias="GATE_PAPER_DAYS")
     gate_paper_min_pf: float = Field(default=1.10, alias="GATE_PAPER_MIN_PF")
