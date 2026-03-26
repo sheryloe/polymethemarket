@@ -21,6 +21,7 @@ Polymarket paper/live trading engine with:
 - Paper fill source for demo: `PAPER_EXCHANGE_VENUES=binance,bybit`
 - Paper symbol mapping: `PAPER_MARKET_SYMBOL_MAP` (JSON map: `{"market_id":"SYMBOL"}`)
 - Paper ticker list: `PAPER_TICKER_SYMBOLS` (default BTC/ETH/BNB/SOL/ADA/..)
+- Paper post-only mode: `PAPER_POST_ONLY=true`
 - 3/12시간 성능 튜닝: `PAPER_PERF_TUNE_ENABLED`, `PAPER_PERF_TUNE_INTERVAL_HOURS`, `PAPER_PERF_TUNE_INTERVAL_HOURS_SECONDARY`, `PAPER_PERF_TUNE_MIN_PNL_USD`, `PAPER_PERF_TUNE_MIN_TRADES`, `PAPER_PERF_TUNE_TARGET`
 
 ## Telegram Commands

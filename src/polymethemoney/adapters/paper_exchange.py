@@ -95,19 +95,91 @@ class PaperExchange:
                 created_at=datetime.now(timezone.utc),
             )
 
+        if quote.ask <= 0 or quote.bid <= 0:
+            return FillResult(
+                order_id=str(uuid4()),
+                market_id=market_id,
+                side=intent.side,
+                fill_price=intent.price,
+                size_usd=intent.size_usd,
+                status="rejected_bad_quote",
+                fee_usd=0.0,
+                mode=TradingMode.PAPER,
+                created_at=datetime.now(timezone.utc),
+            )
+
+        spread = quote.ask - quote.bid
+        if spread > self.settings.max_spread:
+            return FillResult(
+                order_id=str(uuid4()),
+                market_id=market_id,
+                side=intent.side,
+                fill_price=intent.price,
+                size_usd=intent.size_usd,
+                status="rejected_wide_spread",
+                fee_usd=0.0,
+                mode=TradingMode.PAPER,
+                created_at=datetime.now(timezone.utc),
+            )
+
+        yes_bid = quote.bid
+        yes_ask = quote.ask
+        no_bid = max(0.001, 1.0 - yes_ask)
+        no_ask = max(0.001, 1.0 - yes_bid)
+
+        post_only = bool(self.settings.paper_post_only)
         fill_price = intent.price
         status = "open"
         if intent.side.value == "YES":
-            if intent.price >= quote.ask:
-                fill_price = quote.ask
-                status = "filled"
-        else:
-            no_bid = max(0.001, 1.0 - quote.ask)
-            if intent.price >= no_bid:
-                fill_price = no_bid
-                status = "filled"
+            if post_only:
+                if intent.price >= yes_ask:
+                    return FillResult(
+                        order_id=str(uuid4()),
+                        market_id=market_id,
+                        side=intent.side,
+                        fill_price=intent.price,
+                        size_usd=intent.size_usd,
+                        status="rejected_post_only",
+                        fee_usd=0.0,
+                        mode=TradingMode.PAPER,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                if intent.price <= yes_bid:
+                    fill_price = yes_bid
+                    status = "filled"
+                else:
+                    fill_price = intent.price
+                    status = "unfilled"
             else:
-                fill_price = intent.price
+                if intent.price >= yes_ask:
+                    fill_price = yes_ask
+                    status = "filled"
+        else:
+            if post_only:
+                if intent.price >= no_ask:
+                    return FillResult(
+                        order_id=str(uuid4()),
+                        market_id=market_id,
+                        side=intent.side,
+                        fill_price=intent.price,
+                        size_usd=intent.size_usd,
+                        status="rejected_post_only",
+                        fee_usd=0.0,
+                        mode=TradingMode.PAPER,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                if intent.price <= no_bid:
+                    fill_price = no_bid
+                    status = "filled"
+                else:
+                    fill_price = intent.price
+                    status = "unfilled"
+            else:
+                if intent.price >= no_ask:
+                    fill_price = no_ask
+                    status = "filled"
+                else:
+                    fill_price = intent.price
         if status != "filled":
             return FillResult(
                 order_id=str(uuid4()),
@@ -278,4 +350,3 @@ class PaperExchange:
         hashed = sha256(market_id.encode("utf-8")).hexdigest()
         index = int(hashed[:8], 16) % len(self._tick_symbols)
         return self._tick_symbols[index]
-

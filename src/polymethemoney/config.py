@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     paper_ticker_spread_bps: float = Field(default=5.0, alias="PAPER_TICKER_SPREAD_BPS")
     paper_ticker_timeout_seconds: float = Field(default=2.0, alias="PAPER_TICKER_TIMEOUT_SECONDS")
     paper_fallback_to_polymarket: bool = Field(default=False, alias="PAPER_FALLBACK_TO_POLYMARKET")
+    paper_post_only: bool = Field(default=False, alias="PAPER_POST_ONLY")
     paper_binance_bookticker_url: str = Field(
         default="https://api.binance.com/api/v3/ticker/24hr",
         alias="PAPER_BINANCE_BOOKTICKER_URL",
