@@ -293,7 +293,7 @@ class TradingApp:
             await self._notify(f"[paper 성능튜닝] 재학습 실패: {exc}")
 
     async def _collect_recent_paper_performance(self, window_hours: int) -> dict[str, float | int] | None:
-        # 지원되는 store 메서드 우선순위로 성능 지표 조회(최신 구현체 기준)
+        # 지원되는 store 메서드 우선순위로 성능 지표 조회
         candidates = [
             ("get_recent_paper_performance", {"hours": window_hours}),
             ("get_paper_performance", {"hours": window_hours}),
