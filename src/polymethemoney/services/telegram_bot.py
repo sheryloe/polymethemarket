@@ -89,7 +89,10 @@ class TelegramBotService:
         if cmd in ("/help", "/start"):
             await self._send_message(client, self._help_text())
             return
-        if cmd in ("/status", "/report60"):
+        if cmd == "/status":
+            await self._send_message(client, await self._build_status_card())
+            return
+        if cmd in ("/report60", "/report"):
             await self._send_message(client, await self._build_report_card(60))
             return
         if cmd == "/report6h":
@@ -115,12 +118,44 @@ class TelegramBotService:
     def _help_text(self) -> str:
         return (
             "[명령어]\n"
-            "/status - 60분 요약\n"
+            "/status - 요약 카드\n"
             "/report60 - 60분 요약\n"
             "/report6h - 6시간 요약\n"
             "/pnl - 손익 요약\n"
-            "/positions - 포지션 요약\n"
+            "/positions [N] - 포지션 상세\n"
             "/help - 도움말"
+        )
+
+    async def _build_status_card(self) -> str:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        positions = await self._collect_positions()
+        pending_count = await self._collect_pending_count()
+        risk_line = await self._collect_risk_line()
+        stats = await self._collect_signal_stats(60)
+        fill_line = "체결률 N/A"
+        reject_line = "거절: 없음"
+        if stats is not None:
+            signals = stats["signals"]
+            fills = stats["fills"]
+            fill_rate = fills / max(1, signals)
+            fill_line = f"체결률 {fill_rate:.0%} ({fills}/{signals})"
+            reject_line = f"거절: {self._format_top_rejects(stats.get('rejections', {}), 3)}"
+
+        pos_total = len(positions)
+        pos_pl = self._summarize_position_pnl(positions)
+        mode = getattr(self.runtime_state, "trading_mode", "unknown")
+        status = "운영중"
+        if getattr(self.runtime_state, "paused", False) or getattr(self.runtime_state, "trading_paused", False):
+            status = "일시정지"
+
+        return (
+            "[상태]\n"
+            f"시각 {now}\n"
+            f"모드 {mode} | 상태 {status}\n"
+            f"포지션 {pos_total}개 (+{pos_pl['pos']}/0{pos_pl['flat']}/-{pos_pl['neg']}) | 승인대기 {pending_count}건\n"
+            f"{risk_line}\n"
+            f"{fill_line}\n"
+            f"{reject_line}"
         )
 
     async def _build_report_card(self, window_minutes: int) -> str:
@@ -156,7 +191,13 @@ class TelegramBotService:
         count = len(positions)
         if count == 0:
             return "[포지션]\n없음"
-        return f"[포지션]\n총 {count}개"
+
+        limit = self._safe_int(arg, 10)
+        limit = max(1, min(limit, 20))
+        lines = [f"[포지션] 총 {count}개 (상위 {limit})"]
+        for idx, pos in enumerate(positions[:limit], 1):
+            lines.append(self._format_position_line(idx, pos))
+        return "\n".join(lines)
 
     async def _collect_signal_stats(self, window_minutes: int) -> dict[str, Any] | None:
         candidates = [
@@ -193,6 +234,55 @@ class TelegramBotService:
                 return result
         return []
 
+    async def _collect_pending_count(self) -> int:
+        candidates = [
+            ("get_pending_signals", {}),
+            ("list_pending_signals", {}),
+            ("get_pending_approvals", {}),
+        ]
+        for name, kwargs in candidates:
+            method = getattr(self.store, name, None)
+            if method is None:
+                continue
+            result = method(**kwargs)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if isinstance(result, list):
+                return len(result)
+        return 0
+
+    async def _collect_risk_line(self) -> str:
+        daily_dd = None
+        weekly_dd = None
+        kill = None
+
+        for attr in ("risk_state", "state"):
+            state = getattr(self.risk_engine, attr, None)
+            if isinstance(state, dict):
+                daily_dd = state.get("daily_dd")
+                weekly_dd = state.get("weekly_dd")
+                kill = state.get("kill_switch")
+                break
+
+        if daily_dd is None or weekly_dd is None:
+            method = getattr(self.risk_engine, "get_state", None) or getattr(self.risk_engine, "get_risk_state", None)
+            if method is not None:
+                result = method()
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if isinstance(result, dict):
+                    daily_dd = result.get("daily_dd")
+                    weekly_dd = result.get("weekly_dd")
+                    kill = result.get("kill_switch")
+
+        dd_line = "DD N/A"
+        if isinstance(daily_dd, (int, float)) and isinstance(weekly_dd, (int, float)):
+            dd_line = f"DD {daily_dd:.2%}/{weekly_dd:.2%}"
+        kill_line = "킬스위치 N/A"
+        if isinstance(kill, bool):
+            kill_line = "킬스위치 ON" if kill else "킬스위치 OFF"
+        return f"{dd_line} | {kill_line}"
+
     def _parse_signal_stats_payload(self, payload: Any) -> dict[str, Any] | None:
         if payload is None:
             return None
@@ -220,7 +310,47 @@ class TelegramBotService:
         items = items[:top_n]
         return ", ".join([f"{k} {v}" for k, v in items])
 
+    def _format_position_line(self, idx: int, pos: dict[str, Any]) -> str:
+        side = pos.get("side") or pos.get("outcome") or "N/A"
+        size = pos.get("size_usd") or pos.get("notional_usd") or pos.get("size") or "N/A"
+        entry = pos.get("entry_price") or pos.get("avg_entry_price") or pos.get("price")
+        mark = pos.get("mark_price") or pos.get("current_price") or pos.get("last_price")
+        pnl = pos.get("pnl_unrealized") or pos.get("pnl") or pos.get("unrealized_pnl")
+        market_id = pos.get("market_id") or pos.get("market") or "-"
+        title = pos.get("title") or pos.get("question") or ""
+
+        entry_str = f"{entry:.4f}" if isinstance(entry, (int, float)) else "N/A"
+        mark_str = f"{mark:.4f}" if isinstance(mark, (int, float)) else "N/A"
+        pnl_str = f"{pnl:+.2f}" if isinstance(pnl, (int, float)) else "N/A"
+        size_str = f"{size:.2f}" if isinstance(size, (int, float)) else str(size)
+
+        suffix = f" | {market_id}"
+        if title:
+            suffix += f" | {title[:40]}"
+        return f"{idx}. {side} {size_str} USD @ {entry_str} -> {mark_str} ({pnl_str}){suffix}"
+
+    def _summarize_position_pnl(self, positions: list[dict[str, Any]]) -> dict[str, int]:
+        pos = neg = flat = 0
+        for item in positions:
+            pnl = item.get("pnl_unrealized") or item.get("pnl") or item.get("unrealized_pnl")
+            if not isinstance(pnl, (int, float)):
+                flat += 1
+                continue
+            if pnl > 0:
+                pos += 1
+            elif pnl < 0:
+                neg += 1
+            else:
+                flat += 1
+        return {"pos": pos, "neg": neg, "flat": flat}
+
+    def _safe_int(self, value: str, default: int) -> int:
+        try:
+            return int(value.strip())
+        except (TypeError, ValueError, AttributeError):
+            return default
+
     def _should_rewrite_report(self, text: str) -> bool:
         if not text:
             return False
-        return "정기 리포트" in text or "상태 요약" in text
+        return "정기 리포트" in text or "상태 요약" in text or "리포트" in text

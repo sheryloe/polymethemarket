@@ -197,7 +197,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
-    report_interval_minutes: int = Field(default=60, alias="REPORT_INTERVAL_MINUTES")
+    report_interval_minutes: int = Field(default=30, alias="REPORT_INTERVAL_MINUTES")
 
     training_intraday_file: str = Field(default="data/training_intraday.csv", alias="TRAINING_INTRADAY_FILE")
     training_settlement_file: str = Field(default="data/training_settlement.csv", alias="TRAINING_SETTLEMENT_FILE")
