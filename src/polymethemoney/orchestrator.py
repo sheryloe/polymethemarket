@@ -174,15 +174,29 @@ class TradingApp:
             id="incremental_retrain",
             replace_existing=True,
         )
+        primary_hours = max(1, self.settings.paper_perf_tune_interval_hours)
         self.scheduler.add_job(
             self._paper_performance_guard,
             "interval",
-            hours=max(1, self.settings.paper_perf_tune_interval_hours),
-            id="paper_perf_tune_check",
+            hours=primary_hours,
+            id="paper_perf_tune_check_primary",
             replace_existing=True,
             coalesce=True,
             max_instances=1,
+            kwargs={"window_hours": primary_hours},
         )
+        secondary_hours = int(self.settings.paper_perf_tune_interval_hours_secondary or 0)
+        if secondary_hours > 0 and secondary_hours != primary_hours:
+            self.scheduler.add_job(
+                self._paper_performance_guard,
+                "interval",
+                hours=secondary_hours,
+                id="paper_perf_tune_check_secondary",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                kwargs={"window_hours": secondary_hours},
+            )
         self.scheduler.add_job(
             model_engine.retrain_full,
             CronTrigger(
@@ -228,7 +242,7 @@ class TradingApp:
             if self.engine is not None:
                 await self.engine.dispose()
 
-    async def _paper_performance_guard(self) -> None:
+    async def _paper_performance_guard(self, window_hours: int | None = None) -> None:
         if not self.settings.paper_perf_tune_enabled:
             return
         if self.runtime is None or self.model_engine is None or self.notifier is None or self.store is None:
@@ -240,7 +254,8 @@ class TradingApp:
 
         self._paper_perf_tune_inflight = True
         try:
-            performance = await self._collect_recent_paper_performance(self.settings.paper_perf_tune_interval_hours)
+            hours = max(1, int(window_hours or self.settings.paper_perf_tune_interval_hours))
+            performance = await self._collect_recent_paper_performance(hours)
             if performance is None:
                 return
 
@@ -255,11 +270,9 @@ class TradingApp:
             self._last_paper_perf_tune_at = datetime.now(timezone.utc)
             await self._notify(
                 (
-                    "[paper 성능튜닝]\n"
-                    f"최근 {self.settings.paper_perf_tune_interval_hours}시간 누적 수익: {pnl_usd:+.4f} USD\n"
-                    f"체결 건수: {trades}\n"
-                    f"임계치 미달 조건: pnl <= {self.settings.paper_perf_tune_min_pnl_usd:.4f} 및 거래 >= {self.settings.paper_perf_tune_min_trades}\n"
-                    f"{target} 모델 재학습을 즉시 실행합니다."
+                    "[paper 튜닝]\n"
+                    f"윈도우 {hours}h | PnL {pnl_usd:+.2f} | Trades {trades}\n"
+                    f"조건 미달 → 재학습 시작 (pnl <= {self.settings.paper_perf_tune_min_pnl_usd:.2f})"
                 )
             )
 
@@ -269,7 +282,7 @@ class TradingApp:
             await self._trigger_model_retrain(**kwargs)
         except Exception as exc:
             logger.exception("paper performance tuning failed")
-            await self._notify(f"[paper 성능튜닝] 실패: {exc}")
+            await self._notify(f"[paper 튜닝] 실패: {exc}")
         finally:
             self._paper_perf_tune_inflight = False
 
@@ -279,18 +292,18 @@ class TradingApp:
 
         retrain_fn = getattr(self.model_engine, "retrain_incremental", None)
         if retrain_fn is None:
-            await self._notify("[paper 성능튜닝] 재학습 함수를 찾지 못해 종료합니다.")
+            await self._notify("[paper 튜닝] 재학습 함수 없음")
             return
 
         try:
             result = retrain_fn(**kwargs) if kwargs else retrain_fn()
             if isawaitable(result):
                 await result
-            await self._notify("[paper 성능튜닝] 재학습 완료. 누적수익 미달 조건을 반영해 모델을 즉시 업데이트했습니다.")
+            await self._notify("[paper 튜닝] 재학습 완료")
             logger.info("paper performance tune triggered: target=%s kwargs=%s", self.settings.paper_perf_tune_target, kwargs)
         except Exception as exc:
             logger.exception("paper performance retrain failed")
-            await self._notify(f"[paper 성능튜닝] 재학습 실패: {exc}")
+            await self._notify(f"[paper 튜닝] 재학습 실패: {exc}")
 
     async def _collect_recent_paper_performance(self, window_hours: int) -> dict[str, float | int] | None:
         # 지원되는 store 메서드 우선순위로 성능 지표 조회
