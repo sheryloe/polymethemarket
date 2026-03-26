@@ -90,6 +90,12 @@ class Settings(BaseSettings):
     auto_tune_min_signals: int = Field(default=5, alias="AUTO_TUNE_MIN_SIGNALS")
     auto_tune_min_position_usd: float = Field(default=1.0, alias="AUTO_TUNE_MIN_POSITION_USD")
     auto_tune_apply_once: bool = Field(default=True, alias="AUTO_TUNE_APPLY_ONCE")
+    paper_perf_tune_enabled: bool = Field(default=True, alias="PAPER_PERF_TUNE_ENABLED")
+    paper_perf_tune_interval_hours: int = Field(default=6, alias="PAPER_PERF_TUNE_INTERVAL_HOURS")
+    paper_perf_tune_min_pnl_usd: float = Field(default=0.0, alias="PAPER_PERF_TUNE_MIN_PNL_USD")
+    paper_perf_tune_min_trades: int = Field(default=1, alias="PAPER_PERF_TUNE_MIN_TRADES")
+    paper_perf_tune_target: str = Field(default="both", alias="PAPER_PERF_TUNE_TARGET")
+    paper_perf_tune_only_in_paper: bool = Field(default=True, alias="PAPER_PERF_TUNE_ONLY_IN_PAPER")
 
     train_days: int = Field(default=180, alias="TRAIN_DAYS")
     valid_days: int = Field(default=30, alias="VALID_DAYS")
