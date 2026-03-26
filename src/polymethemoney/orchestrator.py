@@ -58,6 +58,8 @@ class TradingApp:
         self.runtime = None
         self._paper_perf_tune_inflight = False
         self._last_paper_perf_tune_at: datetime | None = None
+        self._auto_threshold_tune_inflight = False
+        self._last_auto_threshold_tune_at: datetime | None = None
 
     async def run(self) -> None:
         self.engine, session_factory = create_engine_and_session(self.settings.database_url)
@@ -197,6 +199,18 @@ class TradingApp:
                 max_instances=1,
                 kwargs={"window_hours": secondary_hours},
             )
+        if self.settings.auto_threshold_tune_enabled:
+            window_minutes = max(15, int(self.settings.auto_threshold_tune_window_minutes))
+            self.scheduler.add_job(
+                self._auto_threshold_tune_guard,
+                "interval",
+                minutes=window_minutes,
+                id="auto_threshold_tune",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                kwargs={"window_minutes": window_minutes},
+            )
         self.scheduler.add_job(
             model_engine.retrain_full,
             CronTrigger(
@@ -331,6 +345,167 @@ class TradingApp:
 
         logger.warning("paper performance source 미정의: 수동 튜닝 스킵")
         return None
+
+    async def _auto_threshold_tune_guard(self, window_minutes: int | None = None) -> None:
+        if not self.settings.auto_threshold_tune_enabled:
+            return
+        if self.runtime is None or self.store is None or self.notifier is None:
+            return
+        if self.settings.paper_perf_tune_only_in_paper and self.runtime.trading_mode != TradingMode.PAPER:
+            return
+        if self._auto_threshold_tune_inflight:
+            return
+
+        cooldown = max(1, int(self.settings.auto_threshold_tune_cooldown_minutes))
+        if self._last_auto_threshold_tune_at is not None:
+            elapsed = datetime.now(timezone.utc) - self._last_auto_threshold_tune_at
+            if elapsed.total_seconds() < cooldown * 60:
+                return
+
+        self._auto_threshold_tune_inflight = True
+        try:
+            minutes = max(1, int(window_minutes or self.settings.auto_threshold_tune_window_minutes))
+            stats = await self._collect_recent_signal_stats(minutes)
+            if stats is None:
+                return
+
+            signals = stats["signals"]
+            fills = stats["fills"]
+            rejections = stats["rejections"]
+            pnl = stats.get("pnl_usd")
+
+            if signals < self.settings.auto_threshold_tune_min_signals:
+                return
+
+            fill_rate = fills / max(1, signals)
+            low = self.settings.auto_threshold_tune_fillrate_low
+            high = self.settings.auto_threshold_tune_fillrate_high
+
+            changes: list[str] = []
+
+            if fill_rate <= low:
+                if "size_below_min" in rejections:
+                    changed = self._apply_threshold_change(
+                        "min_position_usd",
+                        -self.settings.auto_threshold_tune_step_min_usd,
+                        self.settings.auto_threshold_tune_min_position_usd_min,
+                        self.settings.auto_threshold_tune_min_position_usd_max,
+                    )
+                    if changed:
+                        changes.append(f"MIN_POSITION_USD {changed[0]:.2f}->{changed[1]:.2f}")
+                if "price_below_min" in rejections or "min_contract_price" in rejections:
+                    changed = self._apply_threshold_change(
+                        "signal_min_contract_price",
+                        -self.settings.auto_threshold_tune_step_min_price,
+                        self.settings.auto_threshold_tune_min_contract_price_min,
+                        self.settings.auto_threshold_tune_min_contract_price_max,
+                    )
+                    if changed:
+                        changes.append(f"SIGNAL_MIN_CONTRACT_PRICE {changed[0]:.4f}->{changed[1]:.4f}")
+                if "score_below_threshold" in rejections or "net_ev_below_min" in rejections:
+                    changed = self._apply_threshold_change(
+                        "signal_min_net_ev",
+                        -self.settings.auto_threshold_tune_step_net_ev,
+                        self.settings.auto_threshold_tune_min_net_ev,
+                        self.settings.auto_threshold_tune_max_net_ev,
+                    )
+                    if changed:
+                        changes.append(f"SIGNAL_MIN_NET_EV {changed[0]:.5f}->{changed[1]:.5f}")
+            elif fill_rate >= high and pnl is not None and pnl < 0:
+                changed = self._apply_threshold_change(
+                    "signal_min_net_ev",
+                    self.settings.auto_threshold_tune_step_net_ev,
+                    self.settings.auto_threshold_tune_min_net_ev,
+                    self.settings.auto_threshold_tune_max_net_ev,
+                )
+                if changed:
+                    changes.append(f"SIGNAL_MIN_NET_EV {changed[0]:.5f}->{changed[1]:.5f}")
+
+            if not changes:
+                return
+
+            self._last_auto_threshold_tune_at = datetime.now(timezone.utc)
+            change_summary = "; ".join(changes)
+            await self._notify(
+                (
+                    "[자동 튜닝]\n"
+                    f"윈도우 {minutes}m | FillRate {fill_rate:.2f} | Signals {signals} Fills {fills}\n"
+                    f"{change_summary}"
+                )
+            )
+        except Exception as exc:
+            logger.exception("auto threshold tune failed")
+            await self._notify(f"[자동 튜닝] 실패: {exc}")
+        finally:
+            self._auto_threshold_tune_inflight = False
+
+    async def _collect_recent_signal_stats(self, window_minutes: int) -> dict[str, object] | None:
+        candidates = [
+            ("get_recent_signal_stats", {"window_minutes": window_minutes}),
+            ("get_signal_stats", {"window_minutes": window_minutes}),
+            ("get_report_window", {"window_minutes": window_minutes}),
+            ("get_report_window", {"window_minutes": window_minutes, "include_rejections": True}),
+        ]
+        for name, kwargs in candidates:
+            method = getattr(self.store, name, None)
+            if method is None:
+                continue
+            try:
+                result = method(**kwargs)
+                if isawaitable(result):
+                    result = await result
+                stats = self._parse_signal_stats_payload(result)
+                if stats is not None:
+                    return stats
+            except Exception:
+                logger.exception("signal stats collect failed: %s", name)
+                continue
+        logger.warning("signal stats source 미정의: 자동 튜닝 스킵")
+        return None
+
+    def _parse_signal_stats_payload(self, payload: object) -> dict[str, object] | None:
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            signals = self._pick_first_int(payload, ("signals", "signal_count", "num_signals"), default=0)
+            fills = self._pick_first_int(payload, ("fills", "fill_count", "filled_trades"), default=0)
+            rejections = payload.get("rejections") or payload.get("rejects") or payload.get("reject_reasons") or {}
+            if not isinstance(rejections, dict):
+                rejections = {}
+            pnl = self._pick_first_float(
+                payload,
+                keys=("pnl_usd", "net_pnl_usd", "cumulative_pnl_usd", "realized_pnl_usd"),
+                default=None,
+            )
+            return {
+                "signals": signals or 0,
+                "fills": fills or 0,
+                "rejections": rejections,
+                "pnl_usd": pnl,
+            }
+        for attr in ("signals", "signal_count", "num_signals"):
+            if hasattr(payload, attr):
+                signals = self._to_int(getattr(payload, attr))
+                break
+        else:
+            signals = 0
+        for attr in ("fills", "fill_count", "filled_trades"):
+            if hasattr(payload, attr):
+                fills = self._to_int(getattr(payload, attr))
+                break
+        else:
+            fills = 0
+        rejections = {}
+        pnl = None
+        return {"signals": signals or 0, "fills": fills or 0, "rejections": rejections, "pnl_usd": pnl}
+
+    def _apply_threshold_change(self, field: str, delta: float, min_value: float, max_value: float) -> tuple[float, float] | None:
+        current = float(getattr(self.settings, field))
+        new_value = max(min_value, min(max_value, current + float(delta)))
+        if abs(new_value - current) < 1e-12:
+            return None
+        setattr(self.settings, field, new_value)
+        return current, new_value
 
     def _parse_performance_payload(self, payload: object) -> dict[str, float | int] | None:
         if payload is None:

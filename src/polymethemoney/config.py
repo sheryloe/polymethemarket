@@ -91,6 +91,29 @@ class Settings(BaseSettings):
     auto_tune_min_signals: int = Field(default=5, alias="AUTO_TUNE_MIN_SIGNALS")
     auto_tune_min_position_usd: float = Field(default=1.0, alias="AUTO_TUNE_MIN_POSITION_USD")
     auto_tune_apply_once: bool = Field(default=True, alias="AUTO_TUNE_APPLY_ONCE")
+    auto_threshold_tune_enabled: bool = Field(default=True, alias="AUTO_THRESHOLD_TUNE_ENABLED")
+    auto_threshold_tune_window_minutes: int = Field(default=180, alias="AUTO_THRESHOLD_TUNE_WINDOW_MINUTES")
+    auto_threshold_tune_min_signals: int = Field(default=20, alias="AUTO_THRESHOLD_TUNE_MIN_SIGNALS")
+    auto_threshold_tune_fillrate_low: float = Field(default=0.15, alias="AUTO_THRESHOLD_TUNE_FILLRATE_LOW")
+    auto_threshold_tune_fillrate_high: float = Field(default=0.45, alias="AUTO_THRESHOLD_TUNE_FILLRATE_HIGH")
+    auto_threshold_tune_step_net_ev: float = Field(default=0.00002, alias="AUTO_THRESHOLD_TUNE_STEP_NET_EV")
+    auto_threshold_tune_step_min_price: float = Field(default=0.0005, alias="AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE")
+    auto_threshold_tune_step_min_usd: float = Field(default=0.5, alias="AUTO_THRESHOLD_TUNE_STEP_MIN_USD")
+    auto_threshold_tune_cooldown_minutes: int = Field(default=60, alias="AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES")
+    auto_threshold_tune_min_net_ev: float = Field(default=0.00004, alias="AUTO_THRESHOLD_TUNE_MIN_NET_EV")
+    auto_threshold_tune_max_net_ev: float = Field(default=0.00020, alias="AUTO_THRESHOLD_TUNE_MAX_NET_EV")
+    auto_threshold_tune_min_contract_price_min: float = Field(
+        default=0.001, alias="AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MIN"
+    )
+    auto_threshold_tune_min_contract_price_max: float = Field(
+        default=0.010, alias="AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MAX"
+    )
+    auto_threshold_tune_min_position_usd_min: float = Field(
+        default=1.0, alias="AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MIN"
+    )
+    auto_threshold_tune_min_position_usd_max: float = Field(
+        default=5.0, alias="AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MAX"
+    )
     paper_perf_tune_enabled: bool = Field(default=True, alias="PAPER_PERF_TUNE_ENABLED")
     paper_perf_tune_interval_hours: int = Field(default=3, alias="PAPER_PERF_TUNE_INTERVAL_HOURS")
     paper_perf_tune_interval_hours_secondary: int = Field(default=12, alias="PAPER_PERF_TUNE_INTERVAL_HOURS_SECONDARY")
