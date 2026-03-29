@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     max_spread: float = Field(default=0.025, alias="MAX_SPREAD")
     min_hourly_volume_usd: float = Field(default=10000.0, alias="MIN_HOURLY_VOLUME_USD")
     max_open_per_market_side: int = Field(default=30, alias="MAX_OPEN_PER_MARKET_SIDE")
+    market_side_rotation_enabled: bool = Field(default=True, alias="MARKET_SIDE_ROTATION_ENABLED")
+    market_side_rotation_min_age_minutes: int = Field(default=10, alias="MARKET_SIDE_ROTATION_MIN_AGE_MINUTES")
     signal_reentry_cooldown_seconds: int = Field(default=8, alias="SIGNAL_REENTRY_COOLDOWN_SECONDS")
     signal_min_contract_price: float = Field(default=0.002, alias="SIGNAL_MIN_CONTRACT_PRICE")
     signal_min_net_ev: float = Field(default=0.00008, alias="SIGNAL_MIN_NET_EV")
