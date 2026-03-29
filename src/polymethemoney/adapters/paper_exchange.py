@@ -4,7 +4,6 @@ import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -207,27 +206,24 @@ class PaperExchange:
         )
 
     async def _resolve_price_quote(self, market_id: str) -> tuple[str | None, MarketQuote | None]:
+        tick_quote = self._quotes.get(market_id)
+        if tick_quote is not None:
+            return "polymarket", MarketQuote(
+                bid=tick_quote.bid,
+                ask=tick_quote.ask,
+                last_price=tick_quote.last_price,
+                source=tick_quote.source,
+                symbol="polymarket",
+                updated_at=tick_quote.updated_at,
+            )
+
         symbol = self._symbol_market_map.get(market_id)
-        if not symbol:
-            symbol = self._stable_symbol_for_market(market_id)
         if not symbol:
             return None, None
 
         venue_quote = await self._get_venue_quote(symbol)
         if venue_quote is not None:
             return symbol, venue_quote
-
-        if self.settings.paper_fallback_to_polymarket:
-            tick_quote = self._quotes.get(market_id)
-            if tick_quote is not None:
-                return symbol, MarketQuote(
-                    bid=tick_quote.bid,
-                    ask=tick_quote.ask,
-                    last_price=tick_quote.last_price,
-                    source=tick_quote.source,
-                    symbol="polymarket",
-                    updated_at=tick_quote.updated_at,
-                )
 
         return None, None
 
@@ -345,8 +341,4 @@ class PaperExchange:
         return parsed
 
     def _stable_symbol_for_market(self, market_id: str) -> str | None:
-        if not self._tick_symbols:
-            return None
-        hashed = sha256(market_id.encode("utf-8")).hexdigest()
-        index = int(hashed[:8], 16) % len(self._tick_symbols)
-        return self._tick_symbols[index]
+        return None
