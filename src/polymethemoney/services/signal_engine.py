@@ -165,6 +165,7 @@ class SignalEngine:
         effective = raw_edge * (0.4 + 0.6 * model_confidence)
         effective = self._trend_adjusted_edge(side, effective)
         effective *= (0.5 + 0.5 * quality)
+        effective = self._side_balance_adjust(side, effective)
         return effective
 
     def _edge_score(self, net_ev: float) -> float:
@@ -268,6 +269,28 @@ class SignalEngine:
         bias = max(-1.0, min(1.0, z_score / 3.0))
         confidence = min(1.0, n / 200.0)
         return bias, confidence
+
+    def _side_balance_adjust(self, side: Side, edge: float) -> float:
+        if not self.settings.signal_side_balance_enabled:
+            return edge
+        window = max(10, int(self.settings.signal_side_balance_window))
+        if len(self._recent_candidate_sides) < min(20, window):
+            return edge
+        yes_count = sum(1 for s in self._recent_candidate_sides if s == "YES")
+        no_count = sum(1 for s in self._recent_candidate_sides if s == "NO")
+        total = yes_count + no_count
+        if total <= 0:
+            return edge
+        yes_ratio = yes_count / total
+        no_ratio = no_count / total
+        dominant = "YES" if yes_ratio >= no_ratio else "NO"
+        ratio = max(yes_ratio, no_ratio)
+        if ratio <= self.settings.signal_max_side_ratio:
+            return edge
+        if side.value == dominant:
+            penalty = max(0.0, min(0.9, self.settings.signal_dominant_side_penalty))
+            return edge * (1.0 - penalty)
+        return edge
 
     def _record_candidate_side(self, side: str) -> None:
         self._recent_candidate_sides.append(side)
