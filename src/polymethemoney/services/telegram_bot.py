@@ -9,6 +9,7 @@ import httpx
 
 from polymethemoney.config import Settings
 from polymethemoney.domain import TradingMode
+from polymethemoney.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class TelegramBotService:
         self.risk_engine = risk_engine
         self.gatekeeper = gatekeeper
         self.reporter = reporter
+        self.llm = LLMClient(settings)
         self._token = (settings.telegram_bot_token or "").strip()
         self._chat_id = (settings.telegram_chat_id or "").strip()
         self._api_base = f"https://api.telegram.org/bot{self._token}"
@@ -140,6 +142,12 @@ class TelegramBotService:
         if cmd == "/clear_minpos":
             await self._send_message(client, await self._cmd_clear_minpos())
             return
+        if cmd == "/tuning":
+            await self._send_message(client, await self._cmd_tuning(arg))
+            return
+        if cmd == "/tuning_reset":
+            await self._send_message(client, await self._cmd_tuning_reset())
+            return
         if cmd == "/approve":
             await self._send_message(client, await self._cmd_approve(arg))
             return
@@ -197,6 +205,8 @@ class TelegramBotService:
             "/go_live - 게이트 통과 시 LIVE 전환(하드락이면 차단)\n"
             "/set_minpos <usd> - 최소 진입 금액 override\n"
             "/clear_minpos - 최소 진입 override 해제\n"
+            "/tuning <goal> - LLM 튜닝 제안 런타임 적용\n"
+            "/tuning_reset - LLM 튜닝 오버라이드 해제\n"
             "승인/거절\n"
             "/approve <signal_id> - 승인\n"
             "/reject <signal_id> - 거절\n"
@@ -355,6 +365,89 @@ class TelegramBotService:
         self.runtime_state.min_position_usd_override = None
         return "[사이징]\n최소 진입금액 override 해제."
 
+    async def _cmd_tuning(self, arg: str) -> str:
+        if not self.settings.llm_enabled or not self.settings.llm_tuning_enabled:
+            return "[튜닝]\nLLM 튜닝 비활성 상태입니다."
+        if self.runtime_state.trading_mode != TradingMode.PAPER:
+            return "[튜닝]\nPAPER 모드에서만 사용 가능합니다."
+        healthy = await self.llm.health()
+        if not healthy:
+            return "[튜닝]\nLLM 브리지 상태 불가(health 실패)."
+
+        goal = arg.strip() or "수익 개선"
+        summary = await self.store.signal_window_summary(window_minutes=self.settings.llm_tuning_window_minutes)
+        snapshot = await self.store.status_snapshot()
+        risk_state = await self.risk_engine.refresh_state()
+
+        allowlist = self._tuning_allowlist()
+        context = {
+            "window_minutes": int(self.settings.llm_tuning_window_minutes),
+            "signals": int(summary["total_signals"]),
+            "fills": int(summary["filled_signals"]),
+            "fill_rate": float(summary["fill_rate"]),
+            "yes_no": {"yes": int(summary["yes_signals"]), "no": int(summary["no_signals"])},
+            "reject_top": summary.get("reject_top", []),
+            "pnl_day": float(snapshot["day_pnl"]),
+            "pnl_week": float(snapshot["week_pnl"]),
+            "drawdown_day": float(risk_state.daily_drawdown_pct),
+            "drawdown_week": float(risk_state.weekly_drawdown_pct),
+            "params": {key: value["current"] for key, value in allowlist.items()},
+            "bounds": {key: {"min": value["min"], "max": value["max"]} for key, value in allowlist.items()},
+        }
+
+        response = await self.llm.suggest_tuning(goal, context)
+        if not response.ok or response.payload is None:
+            return f"[튜닝]\nLLM 응답 실패: {response.error}"
+
+        changes = response.payload.get("changes") or []
+        if not isinstance(changes, list) or not changes:
+            return "[튜닝]\n변경 제안 없음."
+
+        max_changes = max(1, int(self.settings.llm_tuning_max_changes))
+        applied: list[str] = []
+        skipped: list[str] = []
+        for item in changes[:max_changes]:
+            if not isinstance(item, dict):
+                skipped.append("invalid_item")
+                continue
+            key = str(item.get("key") or "").strip().upper()
+            if key not in allowlist:
+                skipped.append(f"{key}:not_allowed")
+                continue
+            try:
+                value = float(item.get("value"))
+            except (TypeError, ValueError):
+                skipped.append(f"{key}:invalid_value")
+                continue
+            applied_line = self._apply_tuning_override(key, value, allowlist[key])
+            if applied_line is None:
+                skipped.append(f"{key}:no_change")
+                continue
+            applied.append(applied_line)
+
+        if not applied:
+            reason = ", ".join(skipped[:3]) if skipped else "no_change"
+            return f"[튜닝]\n적용 없음. 사유: {reason}"
+
+        self.runtime_state.tuning_last_applied_at = datetime.now(timezone.utc)
+        applied_text = "\n".join(applied[:5])
+        skipped_text = ""
+        if skipped:
+            skipped_text = "\n스킵 " + ", ".join(skipped[:5])
+        return f"[튜닝 적용]\n{applied_text}{skipped_text}"
+
+    async def _cmd_tuning_reset(self) -> str:
+        if not self.runtime_state.tuning_originals:
+            return "[튜닝 리셋]\n해제할 오버라이드가 없습니다."
+        for key, original in list(self.runtime_state.tuning_originals.items()):
+            attr = self._tuning_attr_from_key(key)
+            if attr:
+                setattr(self.settings, attr, original)
+        self.runtime_state.tuning_overrides.clear()
+        self.runtime_state.tuning_originals.clear()
+        self.runtime_state.tuning_last_applied_at = None
+        return "[튜닝 리셋]\n모든 런타임 오버라이드 해제."
+
     async def _cmd_approve(self, arg: str) -> str:
         signal_id = arg.strip()
         if not signal_id:
@@ -504,3 +597,114 @@ class TelegramBotService:
             f"미존재 {result.get('missing', 0)} | 가격없음 {result.get('no_price', 0)}\n"
             f"실현손익 {float(result.get('realized_pnl_usd', 0.0)):+.2f} USD"
         )
+
+    def _tuning_allowlist(self) -> dict[str, dict[str, float]]:
+        return {
+            "MIN_POSITION_USD": {
+                "attr": "min_position_usd",
+                "min": float(self.settings.auto_threshold_tune_min_position_usd_min),
+                "max": float(self.settings.auto_threshold_tune_min_position_usd_max),
+                "current": float(self.settings.min_position_usd),
+            },
+            "SIGNAL_MIN_NET_EV": {
+                "attr": "signal_min_net_ev",
+                "min": float(self.settings.auto_threshold_tune_min_net_ev),
+                "max": float(self.settings.auto_threshold_tune_max_net_ev),
+                "current": float(self.settings.signal_min_net_ev),
+            },
+            "SIGNAL_MIN_CONTRACT_PRICE": {
+                "attr": "signal_min_contract_price",
+                "min": float(self.settings.auto_threshold_tune_min_contract_price_min),
+                "max": float(self.settings.auto_threshold_tune_min_contract_price_max),
+                "current": float(self.settings.signal_min_contract_price),
+            },
+            "AUTO_THRESHOLD_TUNE_WINDOW_MINUTES": {
+                "attr": "auto_threshold_tune_window_minutes",
+                "min": 30.0,
+                "max": 240.0,
+                "current": float(self.settings.auto_threshold_tune_window_minutes),
+            },
+            "AUTO_THRESHOLD_TUNE_MIN_SIGNALS": {
+                "attr": "auto_threshold_tune_min_signals",
+                "min": 5.0,
+                "max": 200.0,
+                "current": float(self.settings.auto_threshold_tune_min_signals),
+            },
+            "AUTO_THRESHOLD_TUNE_FILLRATE_LOW": {
+                "attr": "auto_threshold_tune_fillrate_low",
+                "min": 0.05,
+                "max": 0.6,
+                "current": float(self.settings.auto_threshold_tune_fillrate_low),
+            },
+            "AUTO_THRESHOLD_TUNE_FILLRATE_HIGH": {
+                "attr": "auto_threshold_tune_fillrate_high",
+                "min": 0.2,
+                "max": 0.95,
+                "current": float(self.settings.auto_threshold_tune_fillrate_high),
+            },
+            "AUTO_THRESHOLD_TUNE_STEP_NET_EV": {
+                "attr": "auto_threshold_tune_step_net_ev",
+                "min": 0.000001,
+                "max": 0.001,
+                "current": float(self.settings.auto_threshold_tune_step_net_ev),
+            },
+            "AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE": {
+                "attr": "auto_threshold_tune_step_min_price",
+                "min": 0.0001,
+                "max": 0.01,
+                "current": float(self.settings.auto_threshold_tune_step_min_price),
+            },
+            "AUTO_THRESHOLD_TUNE_STEP_MIN_USD": {
+                "attr": "auto_threshold_tune_step_min_usd",
+                "min": 0.1,
+                "max": 5.0,
+                "current": float(self.settings.auto_threshold_tune_step_min_usd),
+            },
+            "AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES": {
+                "attr": "auto_threshold_tune_cooldown_minutes",
+                "min": 5.0,
+                "max": 240.0,
+                "current": float(self.settings.auto_threshold_tune_cooldown_minutes),
+            },
+        }
+
+    @staticmethod
+    def _tuning_attr_from_key(key: str) -> str | None:
+        mapping = {
+            "MIN_POSITION_USD": "min_position_usd",
+            "SIGNAL_MIN_NET_EV": "signal_min_net_ev",
+            "SIGNAL_MIN_CONTRACT_PRICE": "signal_min_contract_price",
+            "AUTO_THRESHOLD_TUNE_WINDOW_MINUTES": "auto_threshold_tune_window_minutes",
+            "AUTO_THRESHOLD_TUNE_MIN_SIGNALS": "auto_threshold_tune_min_signals",
+            "AUTO_THRESHOLD_TUNE_FILLRATE_LOW": "auto_threshold_tune_fillrate_low",
+            "AUTO_THRESHOLD_TUNE_FILLRATE_HIGH": "auto_threshold_tune_fillrate_high",
+            "AUTO_THRESHOLD_TUNE_STEP_NET_EV": "auto_threshold_tune_step_net_ev",
+            "AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE": "auto_threshold_tune_step_min_price",
+            "AUTO_THRESHOLD_TUNE_STEP_MIN_USD": "auto_threshold_tune_step_min_usd",
+            "AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES": "auto_threshold_tune_cooldown_minutes",
+        }
+        return mapping.get(key)
+
+    def _apply_tuning_override(self, key: str, value: float, spec: dict[str, float]) -> str | None:
+        attr = str(spec["attr"])
+        minimum = float(spec["min"])
+        maximum = float(spec["max"])
+        new_value = max(minimum, min(maximum, float(value)))
+        if attr.endswith("_minutes") or attr.endswith("_signals"):
+            new_value = float(int(new_value))
+        if attr == "auto_threshold_tune_fillrate_high":
+            low = float(self.settings.auto_threshold_tune_fillrate_low)
+            if new_value <= low:
+                new_value = min(0.95, max(low + 0.05, new_value))
+        if attr == "auto_threshold_tune_fillrate_low":
+            high = float(self.settings.auto_threshold_tune_fillrate_high)
+            if new_value >= high:
+                new_value = max(0.05, min(high - 0.05, new_value))
+        current = float(getattr(self.settings, attr))
+        if abs(current - new_value) < 1e-12:
+            return None
+        if key not in self.runtime_state.tuning_originals:
+            self.runtime_state.tuning_originals[key] = current
+        setattr(self.settings, attr, new_value)
+        self.runtime_state.tuning_overrides[key] = new_value
+        return f"{key} {current:.6f}->{new_value:.6f}"

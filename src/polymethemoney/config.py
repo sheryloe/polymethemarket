@@ -245,6 +245,14 @@ class Settings(BaseSettings):
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
     report_interval_minutes: int = Field(default=30, alias="REPORT_INTERVAL_MINUTES")
 
+    llm_enabled: bool = Field(default=False, alias="LLM_ENABLED")
+    llm_api_base: str = Field(default="http://127.0.0.1:8787/v1", alias="LLM_API_BASE")
+    llm_model: str = Field(default="gemini:gemini-2.5-flash", alias="LLM_MODEL")
+    llm_tuning_enabled: bool = Field(default=True, alias="LLM_TUNING_ENABLED")
+    llm_tuning_timeout_seconds: int = Field(default=20, alias="LLM_TUNING_TIMEOUT_SECONDS")
+    llm_tuning_window_minutes: int = Field(default=60, alias="LLM_TUNING_WINDOW_MINUTES")
+    llm_tuning_max_changes: int = Field(default=3, alias="LLM_TUNING_MAX_CHANGES")
+
     training_intraday_file: str = Field(default="data/training_intraday.csv", alias="TRAINING_INTRADAY_FILE")
     training_settlement_file: str = Field(default="data/training_settlement.csv", alias="TRAINING_SETTLEMENT_FILE")
 

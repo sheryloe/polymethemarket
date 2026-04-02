@@ -80,6 +80,34 @@ docker compose up -d --build
 docker compose logs -f polymethemoney_app
 ```
 
+## Gemini OAuth Bridge (LLM 튜닝)
+
+이 프로젝트는 `mirofish-ko-oauthbridge`의 `codex-bridge`를 벤더링해 LLM 튜닝에 사용합니다.
+로컬 Gemini CLI 로그인 상태가 필요합니다.
+
+### 브리지 실행 (WSL)
+
+```bash
+cd /mnt/d/Donggri_Platform/Polymethemoney
+bash scripts/run-bridge.sh
+```
+
+### 브리지 실행 (PowerShell)
+
+```powershell
+cd D:\Donggri_Platform\Polymethemoney
+.\scripts\run-bridge.ps1
+```
+
+### LLM 튜닝 활성화 (.env)
+
+```
+LLM_ENABLED=true
+LLM_API_BASE=http://127.0.0.1:8787/v1
+LLM_MODEL=gemini:gemini-2.5-flash
+LLM_TUNING_ENABLED=true
+```
+
 ## Core Commands (Telegram)
 
 - `/status`
@@ -91,11 +119,18 @@ docker compose logs -f polymethemoney_app
 - `/pause` / `/resume`
 - `/closeall`
 - `/go_live` (blocked unless gate passes + manual approval)
+- `/tuning <goal>` (LLM 튜닝 제안 런타임 적용)
+- `/tuning_reset` (튜닝 오버라이드 해제)
 
 ## Security
 
 - `.env` contains secrets and must never be committed.
 - Use `.env.example` for safe defaults.
+
+## License Notice (AGPL)
+
+`vendor/mirofish-oauthbridge`에는 AGPL 라이선스가 포함됩니다.
+해당 디렉터리의 `LICENSE` 및 `NOTICE.md`를 준수해야 합니다.
 
 ## GitHub Pages
 

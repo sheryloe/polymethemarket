@@ -44,6 +44,9 @@ class RuntimeState:
     auto_tune_zero_fill_applied_at: datetime | None = None
     auto_tune_zero_fill_last_outcome: str | None = None
     auto_tune_zero_fill_last_checked_at: datetime | None = None
+    tuning_overrides: dict[str, float] = field(default_factory=dict)
+    tuning_originals: dict[str, float] = field(default_factory=dict)
+    tuning_last_applied_at: datetime | None = None
     structure_alpha: StructureAlphaRuntime = field(default_factory=StructureAlphaRuntime)
     started_at: datetime = field(default_factory=utcnow)
     last_data_at: datetime | None = None
