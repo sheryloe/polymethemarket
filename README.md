@@ -106,6 +106,8 @@ LLM_ENABLED=true
 LLM_API_BASE=http://127.0.0.1:8787/v1
 LLM_MODEL=gemini:gemini-2.5-flash
 LLM_TUNING_ENABLED=true
+LLM_TUNING_ALLOWLIST=
+LLM_TUNING_BLOCKLIST=
 ```
 
 ## Core Commands (Telegram)

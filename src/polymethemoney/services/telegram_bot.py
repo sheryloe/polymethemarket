@@ -599,7 +599,7 @@ class TelegramBotService:
         )
 
     def _tuning_allowlist(self) -> dict[str, dict[str, float]]:
-        return {
+        base = {
             "MIN_POSITION_USD": {
                 "attr": "min_position_usd",
                 "min": float(self.settings.auto_threshold_tune_min_position_usd_min),
@@ -666,7 +666,74 @@ class TelegramBotService:
                 "max": 240.0,
                 "current": float(self.settings.auto_threshold_tune_cooldown_minutes),
             },
+            "SIGNAL_MIN_CONFIDENCE": {
+                "attr": "signal_min_confidence",
+                "min": 0.05,
+                "max": 0.5,
+                "current": float(self.settings.signal_min_confidence),
+            },
+            "SIGNAL_MIN_QUALITY": {
+                "attr": "signal_min_quality",
+                "min": 0.05,
+                "max": 0.5,
+                "current": float(self.settings.signal_min_quality),
+            },
+            "SIGNAL_MIN_RISK_ADJ_EDGE": {
+                "attr": "signal_min_risk_adj_edge",
+                "min": 0.0001,
+                "max": 0.01,
+                "current": float(self.settings.signal_min_risk_adj_edge),
+            },
+            "SIGNAL_MIN_TTE_HOURS": {
+                "attr": "signal_min_tte_hours",
+                "min": 0.1,
+                "max": 24.0,
+                "current": float(self.settings.signal_min_tte_hours),
+            },
+            "SIGNAL_LONG_TTE_MIN_EDGE": {
+                "attr": "signal_long_tte_min_edge",
+                "min": 0.001,
+                "max": 0.02,
+                "current": float(self.settings.signal_long_tte_min_edge),
+            },
+            "SIGNAL_MID_BAND_MIN_NET_EV": {
+                "attr": "signal_mid_band_min_net_ev",
+                "min": 0.0002,
+                "max": 0.01,
+                "current": float(self.settings.signal_mid_band_min_net_ev),
+            },
+            "SIGNAL_TAIL_PROB_FLOOR": {
+                "attr": "signal_tail_prob_floor",
+                "min": 0.01,
+                "max": 0.2,
+                "current": float(self.settings.signal_tail_prob_floor),
+            },
+            "SIGNAL_TAIL_PROB_CEILING": {
+                "attr": "signal_tail_prob_ceiling",
+                "min": 0.8,
+                "max": 0.99,
+                "current": float(self.settings.signal_tail_prob_ceiling),
+            },
+            "SIGNAL_TAIL_EXTRA_NET_EV": {
+                "attr": "signal_tail_extra_net_ev",
+                "min": 0.0001,
+                "max": 0.01,
+                "current": float(self.settings.signal_tail_extra_net_ev),
+            },
+            "SIGNAL_YES_PRIORITY_MARGIN": {
+                "attr": "signal_yes_priority_margin",
+                "min": 0.0001,
+                "max": 0.01,
+                "current": float(self.settings.signal_yes_priority_margin),
+            },
         }
+        allow = self._parse_csv_set(self.settings.llm_tuning_allowlist)
+        block = self._parse_csv_set(self.settings.llm_tuning_blocklist)
+        if allow:
+            base = {key: value for key, value in base.items() if key in allow}
+        if block:
+            base = {key: value for key, value in base.items() if key not in block}
+        return base
 
     @staticmethod
     def _tuning_attr_from_key(key: str) -> str | None:
@@ -682,6 +749,16 @@ class TelegramBotService:
             "AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE": "auto_threshold_tune_step_min_price",
             "AUTO_THRESHOLD_TUNE_STEP_MIN_USD": "auto_threshold_tune_step_min_usd",
             "AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES": "auto_threshold_tune_cooldown_minutes",
+            "SIGNAL_MIN_CONFIDENCE": "signal_min_confidence",
+            "SIGNAL_MIN_QUALITY": "signal_min_quality",
+            "SIGNAL_MIN_RISK_ADJ_EDGE": "signal_min_risk_adj_edge",
+            "SIGNAL_MIN_TTE_HOURS": "signal_min_tte_hours",
+            "SIGNAL_LONG_TTE_MIN_EDGE": "signal_long_tte_min_edge",
+            "SIGNAL_MID_BAND_MIN_NET_EV": "signal_mid_band_min_net_ev",
+            "SIGNAL_TAIL_PROB_FLOOR": "signal_tail_prob_floor",
+            "SIGNAL_TAIL_PROB_CEILING": "signal_tail_prob_ceiling",
+            "SIGNAL_TAIL_EXTRA_NET_EV": "signal_tail_extra_net_ev",
+            "SIGNAL_YES_PRIORITY_MARGIN": "signal_yes_priority_margin",
         }
         return mapping.get(key)
 
@@ -700,6 +777,14 @@ class TelegramBotService:
             high = float(self.settings.auto_threshold_tune_fillrate_high)
             if new_value >= high:
                 new_value = max(0.05, min(high - 0.05, new_value))
+        if attr == "signal_tail_prob_floor":
+            ceiling = float(self.settings.signal_tail_prob_ceiling)
+            if new_value >= ceiling:
+                new_value = max(0.01, min(ceiling - 0.01, new_value))
+        if attr == "signal_tail_prob_ceiling":
+            floor = float(self.settings.signal_tail_prob_floor)
+            if new_value <= floor:
+                new_value = min(0.99, max(floor + 0.01, new_value))
         current = float(getattr(self.settings, attr))
         if abs(current - new_value) < 1e-12:
             return None
@@ -708,3 +793,9 @@ class TelegramBotService:
         setattr(self.settings, attr, new_value)
         self.runtime_state.tuning_overrides[key] = new_value
         return f"{key} {current:.6f}->{new_value:.6f}"
+
+    @staticmethod
+    def _parse_csv_set(raw: str) -> set[str]:
+        if not raw:
+            return set()
+        return {item.strip().upper() for item in raw.split(",") if item.strip()}

@@ -252,6 +252,8 @@ class Settings(BaseSettings):
     llm_tuning_timeout_seconds: int = Field(default=20, alias="LLM_TUNING_TIMEOUT_SECONDS")
     llm_tuning_window_minutes: int = Field(default=60, alias="LLM_TUNING_WINDOW_MINUTES")
     llm_tuning_max_changes: int = Field(default=3, alias="LLM_TUNING_MAX_CHANGES")
+    llm_tuning_allowlist: str = Field(default="", alias="LLM_TUNING_ALLOWLIST")
+    llm_tuning_blocklist: str = Field(default="", alias="LLM_TUNING_BLOCKLIST")
 
     training_intraday_file: str = Field(default="data/training_intraday.csv", alias="TRAINING_INTRADAY_FILE")
     training_settlement_file: str = Field(default="data/training_settlement.csv", alias="TRAINING_SETTLEMENT_FILE")
