@@ -1,0 +1,55 @@
+﻿services:
+  polymethemoney_postgres:
+    image: polymethemoney_postgres:16
+    container_name: polymethemoney_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: polymethemoney
+      POSTGRES_PASSWORD: polymethemoney
+      POSTGRES_DB: polymethemoney
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polymethemoney -d polymethemoney"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ./.docker/postgres:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases:
+          - postgres
+
+  polymethemoney_redis:
+    image: polymethemoney_redis:7
+    container_name: polymethemoney_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./.docker/redis:/data
+    networks:
+      default:
+        aliases:
+          - redis
+
+  polymethemoney_app:
+    image: polymethemoney_app:latest
+    container_name: polymethemoney_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "-m", "polymethemoney.main"]
+    depends_on:
+      polymethemoney_postgres:
+        condition: service_healthy
+      polymethemoney_redis:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    networks:
+      - default
+
+networks:
+  default:
+    name: polymethemoney_net
+
