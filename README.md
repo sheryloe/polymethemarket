@@ -1,165 +1,117 @@
-# Polymethemoney v1.5
+﻿# Polymethemoney
 
-Polymarket paper/live trading engine with:
-- dual-model probabilistic signals (settlement + intraday)
-- structure alpha (pair/basket opportunities)
-- Telegram control and reporting
-- gate policy (`historical 60d + paper 3d`) before live
+High‑frequency, risk‑aware Polymarket paper trading engine with Telegram control, auto‑tuning, and dual‑model signals.
 
-## Core Policy
+Keywords: prediction market, Polymarket, trading bot, paper trading, risk engine, Telegram bot, algorithmic trading
 
-- Default mode: `paper`
-- Demo unlimited: `DEMO_UNLIMITED=false` (실거래 유사 검증 권장)
-- Demo hardlock: `DEMO_PAPER_HARDLOCK=true` (live transition and live execution are blocked)
-- Startup reset: `DEMO_RESET_PAPER_ON_STARTUP=false` (기본값, 재시작 시 포지션 자동 초기화 금지)
-- Live transition: only after gate pass and manual `/go_live`
-- Risk limits: `MAX_POSITIONS`, `MAX_POSITION_USD`, `DAILY_LOSS_LIMIT_PCT`, `WEEKLY_LOSS_LIMIT_PCT`
-- Set `DAILY_LOSS_LIMIT_PCT=0`, `WEEKLY_LOSS_LIMIT_PCT=0` to disable drawdown kill switch
-- Daily profit target: `DAILY_PROFIT_TARGET_PCT` (default `0.10` for 10%)
-- Per-position stop loss: `POSITION_STOP_LOSS_PCT`
-- Per-position take profit: `POSITION_TAKE_PROFIT_PCT`
-- Paper fill source for demo: `PAPER_EXCHANGE_VENUES=binance,bybit`
-- Paper symbol mapping: `PAPER_MARKET_SYMBOL_MAP` (JSON map: `{"market_id":"SYMBOL"}`)
-- Paper ticker list: `PAPER_TICKER_SYMBOLS` (default BTC/ETH/BNB/SOL/ADA/..)
-- Paper post-only mode: `PAPER_POST_ONLY=true`
-- 3/12시간 성능 튜닝: `PAPER_PERF_TUNE_ENABLED`, `PAPER_PERF_TUNE_INTERVAL_HOURS`, `PAPER_PERF_TUNE_INTERVAL_HOURS_SECONDARY`, `PAPER_PERF_TUNE_MIN_PNL_USD`, `PAPER_PERF_TUNE_MIN_TRADES`, `PAPER_PERF_TUNE_TARGET`
+## What This Is
 
-## Telegram Commands
+- Paper‑only by default (live execution is blocked unless gate + manual approval).
+- Dual model: intraday + settlement signals with calibration.
+- Gate policy: historical 60d + paper 3d before live.
+- Telegram commands for control, status, and reports.
 
-- `/help`
-- `/status`
-- `/report60`
-- `/report6h`
-- `/positions [개수]`
-- `/pending`
-- `/pnl`
-- `/risk`
-- `/gate`
-- `/data`
-- `/pause`
-- `/resume`
-- `/kill_on`
-- `/kill_off`
-- `/go_live`
-- `/go_paper`
-- `/set_minpos <usd>`
-- `/clear_minpos`
-- `/approve <signal_id>`
-- `/reject <signal_id>`
-- `/reject_all`
-- `/close <position_id>`
-- `/close_market <market_id>`
-- `/close_side <YES|NO> [limit]`
-- `/closeall`
-- `/panic`
-
-## Setup (WSL)
+## Quick Start (WSL)
 
 ```bash
 cd /mnt/d/Donggri_Platform/Polymethemoney
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e "[dev]"
 cp .env.example .env
 ```
 
-Fill `.env` with Polymarket and Telegram credentials.
+### 1) Create Telegram Bot (BotFather)
 
-## Run
+1. Open Telegram and search `@BotFather`.
+2. Send `/newbot` and follow prompts.
+3. Save the bot token (format: `123456:ABC...`).
+4. Search `@userinfobot`, send `/start` to get your numeric chat ID.
+
+Put into `.env`:
+```
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+```
+
+### 2) Polymarket API Keys
+
+You need API key/secret/passphrase derived from your wallet private key.
+
+```bash
+pip install py-clob-client python-dotenv
+python - <<'PY'
+import os
+from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+
+load_dotenv('.env')
+
+pk = os.getenv('POLYMARKET_PRIVATE_KEY', '').strip()
+if not pk:
+    raise SystemExit('POLYMARKET_PRIVATE_KEY missing')
+
+client = ClobClient(
+    host='https://clob.polymarket.com',
+    chain_id=int(os.getenv('POLYMARKET_CHAIN_ID', '137')),
+    key=pk,
+    signature_type=int(os.getenv('POLYMARKET_SIGNATURE_TYPE', '0')),
+    funder=(os.getenv('POLYMARKET_FUNDER') or None),
+)
+creds = client.create_or_derive_api_creds()
+
+print('POLYMARKET_API_KEY=' + creds.api_key)
+print('POLYMARKET_API_SECRET=' + creds.api_secret)
+print('POLYMARKET_API_PASSPHRASE=' + creds.api_passphrase)
+PY
+```
+
+Put outputs into `.env`:
+```
+POLYMARKET_API_KEY=...
+POLYMARKET_API_SECRET=...
+POLYMARKET_API_PASSPHRASE=...
+```
+
+### 3) Run (Docker)
 
 ```bash
 docker compose up -d --build
-docker compose logs -f app
+docker compose logs -f polymethemoney_app
 ```
 
-## Reset Paper Round
+## Core Commands (Telegram)
 
-```bash
-python scripts/reset_paper_round.py --confirm
-docker compose up -d --build app
-```
+- `/status`
+- `/report60`
+- `/report6h`
+- `/positions [N]`
+- `/pnl`
+- `/risk`
+- `/pause` / `/resume`
+- `/closeall`
+- `/go_live` (blocked unless gate passes + manual approval)
 
-## Backfill + Retrain
+## Security
 
-```bash
-./backfill_markets --since 2y --sources api,subgraph
-./build_training_dataset --target both --lookback-days 730
-./retrain_models --target both --kind full
-```
+- `.env` contains secrets and must never be committed.
+- Use `.env.example` for safe defaults.
 
-## Tuning Controls
+## GitHub Pages
 
-- `TREND_RECENCY_HALF_LIFE_DAYS`
-- `TREND_INTRADAY_RETRAIN_MINUTES`
-- `TREND_ADAPTIVE_ENABLED`
-- `TREND_WINDOW_SIZE`
-- `TREND_ALIGN_BOOST`
-- `TREND_REVERT_PENALTY`
-- `MICRO_REVERT_ENABLED`
-- `MICRO_REVERT_IMB_THRESHOLD`
-- `MICRO_REVERT_MAX_VOL`
-- `MICRO_REVERT_BOOST`
-- `POLYMARKET_USE_BULK_BOOKS` (`false` uses per-token `/book` fallback)
-- `MAX_OPEN_PER_MARKET_SIDE` (prevent repeated stacking on same market+side)
-- `SIGNAL_REENTRY_COOLDOWN_SECONDS`
-- `SIGNAL_MIN_CONTRACT_PRICE` (hard floor for entry contract price)
-- `SIGNAL_MIN_NET_EV`
-- `SIGNAL_TAIL_PROB_FLOOR`
-- `SIGNAL_TAIL_PROB_CEILING`
-- `SIGNAL_TAIL_EXTRA_NET_EV`
-- `SIGNAL_SIDE_BALANCE_ENABLED`
-- `SIGNAL_SIDE_BALANCE_WINDOW`
-- `SIGNAL_MAX_SIDE_RATIO`
-- `SIGNAL_DOMINANT_SIDE_PENALTY`
-- `SIGNAL_DOMINANT_SIDE_HARD_BLOCK` (`실거래 유사 paper에서는 false 권장`)
-- `SIGNAL_SIDE_POLICY` (`YES_PRIORITY` 권장)
-- `SIGNAL_NO_MIN_NET_EV`
-- `SIGNAL_NO_MIN_CONFIDENCE`
-- `SIGNAL_NO_REGIME_TREND_BIAS`
-- `SIGNAL_NO_REGIME_IMBALANCE`
-- `SIGNAL_NO_MAX_RATIO`
-- `AUTO_TUNE_ZERO_FILL_ENABLED`
-  - `AUTO_TUNE_WINDOW_MINUTES`
-  - `AUTO_TUNE_MIN_SIGNALS`
-  - `AUTO_TUNE_MIN_POSITION_USD`
-  - `AUTO_TUNE_APPLY_ONCE`
-  - `AUTO_THRESHOLD_TUNE_ENABLED`
-  - `AUTO_THRESHOLD_TUNE_WINDOW_MINUTES`
-  - `AUTO_THRESHOLD_TUNE_MIN_SIGNALS`
-  - `AUTO_THRESHOLD_TUNE_FILLRATE_LOW`
-  - `AUTO_THRESHOLD_TUNE_FILLRATE_HIGH`
-  - `AUTO_THRESHOLD_TUNE_STEP_NET_EV`
-  - `AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE`
-  - `AUTO_THRESHOLD_TUNE_STEP_MIN_USD`
-  - `AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES`
-  - `AUTO_THRESHOLD_TUNE_MIN_NET_EV`
-  - `AUTO_THRESHOLD_TUNE_MAX_NET_EV`
-  - `AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MIN`
-  - `AUTO_THRESHOLD_TUNE_MIN_CONTRACT_PRICE_MAX`
-  - `AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MIN`
-  - `AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MAX`
-  - `PAPER_PERF_TUNE_ENABLED`
-  - `PAPER_PERF_TUNE_INTERVAL_HOURS`
-  - `PAPER_PERF_TUNE_MIN_PNL_USD`
-  - `PAPER_PERF_TUNE_MIN_TRADES`
-  - `PAPER_PERF_TUNE_TARGET`
-  - `PAPER_PERF_TUNE_ONLY_IN_PAPER`
+This repo includes a landing page in `docs/`.
 
-## Historical Metrics Contract
+Steps:
+1. GitHub → Settings → Pages
+2. Source: `Deploy from a branch`
+3. Branch: `main` (or your default) + Folder: `/docs`
+4. Save
 
-`data/historical_metrics.json`
+Your site will be published at:
+`https://<user>.github.io/<repo>/`
 
-```json
-{
-  "pf": 1.08,
-  "mdd_pct": 0.06,
-  "ece": 0.03,
-  "window_days": 60,
-  "generated_at": "2026-03-21T00:00:00+00:00",
-  "source": "clob_api"
-}
-```
+## Troubleshooting
 
-Pass conditions:
-- historical: `window_days >= 60`, `pf >= 1.05`, `mdd_pct <= 0.08`, `ece <= 0.05`
-- paper: `covered_days >= 3`, `pf >= 1.10`, `max_dd_pct <= 0.04`, `trades >= 10`, `violations <= 0`
+- If no trades occur: check `report60` and rejection reasons.
+- If paper fills are 0: set `PAPER_POST_ONLY=false` and rebuild.
+- If training rows are 0: remove `data/training_*.csv` then restart.

@@ -1,0 +1,115 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Polymethemoney — Polymarket Paper Trading Engine</title>
+  <meta name="description" content="Polymethemoney is a risk-aware Polymarket paper trading engine with dual-model signals, auto-tuning, and Telegram control." />
+  <meta name="keywords" content="Polymarket, prediction market, trading bot, paper trading, algorithmic trading, telegram bot" />
+  <meta property="og:title" content="Polymethemoney" />
+  <meta property="og:description" content="Risk-aware Polymarket paper trading engine with auto-tuning and Telegram control." />
+  <meta property="og:type" content="website" />
+  <meta property="twitter:card" content="summary_large_image" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="hero">
+    <div class="hero-content">
+      <div class="tag">Polymarket Paper Trading Engine</div>
+      <h1>Polymethemoney</h1>
+      <p class="lead">
+        Risk-aware paper trading with dual-model signals, auto-tuning, and Telegram control.
+        Built for fast iteration without risking real funds.
+      </p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/sheryloe/polymethemarket">View Repo</a>
+        <a class="btn ghost" href="#quickstart">Quick Start</a>
+      </div>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-label">Mode</div>
+          <div class="stat-value">Paper-Only</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Signals</div>
+          <div class="stat-value">Intraday + Settlement</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Control</div>
+          <div class="stat-value">Telegram</div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <h2>Why This Stack</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Risk-First Execution</h3>
+          <p>Paper-only hardlock, drawdown guards, SL/TP, and gate checks before live.</p>
+        </div>
+        <div class="card">
+          <h3>Auto-Tuning</h3>
+          <p>Every 6 hours, negative realized PnL triggers model retraining.</p>
+        </div>
+        <div class="card">
+          <h3>High-Signal Pipeline</h3>
+          <p>Features include spread, volatility bands, momentum, and liquidity ratios.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart" class="panel">
+      <h2>Quick Start</h2>
+      <div class="code">
+        <code>cd /mnt/d/Donggri_Platform/Polymethemoney</code>
+        <code>python3 -m venv .venv</code>
+        <code>source .venv/bin/activate</code>
+        <code>pip install -e "[dev]"</code>
+        <code>cp .env.example .env</code>
+        <code>docker compose up -d --build</code>
+      </div>
+      <p class="note">Fill in `.env` with Telegram + Polymarket credentials. Do not commit `.env`.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Architecture</h2>
+      <div class="diagram">
+        <div class="node">Collector</div>
+        <div class="arrow"></div>
+        <div class="node">Feature Engine</div>
+        <div class="arrow"></div>
+        <div class="node">Signal Engine</div>
+        <div class="arrow"></div>
+        <div class="node">Execution + Risk</div>
+        <div class="arrow"></div>
+        <div class="node">Telegram</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Key Commands</h2>
+      <div class="chips">
+        <span>/status</span>
+        <span>/report60</span>
+        <span>/positions</span>
+        <span>/pnl</span>
+        <span>/risk</span>
+        <span>/pause</span>
+        <span>/resume</span>
+        <span>/closeall</span>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>Polymethemoney · Paper Trading Only</div>
+  </footer>
+</body>
+</html>

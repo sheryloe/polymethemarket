@@ -1,0 +1,15 @@
+﻿# Secrets
+.env
+*.pem
+*.key
+
+# Runtime data
+.docker/
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local tooling
+.codex/
