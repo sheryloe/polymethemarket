@@ -13,3 +13,6 @@ __pycache__/
 
 # Local tooling
 .codex/
+
+# Vendor cache
+vendor/awesome-codex-subagents/
