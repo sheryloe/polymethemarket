@@ -386,35 +386,81 @@ class TradingApp:
             high = self.settings.auto_threshold_tune_fillrate_high
 
             changes: list[str] = []
+            top_reason = None
+            top_ratio = 0.0
+            total_rejects = 0
+            top_count = 0
+            for key, val in (rejections or {}).items():
+                try:
+                    count = int(val)
+                except (TypeError, ValueError):
+                    count = 0
+                total_rejects += count
+                if count > top_count:
+                    top_count = count
+                    top_reason = str(key)
+            if total_rejects > 0 and top_reason:
+                top_ratio = top_count / total_rejects
 
             if fill_rate <= low:
-                if "size_below_min" in rejections:
+                step_mult = 2.0 if fills == 0 else 1.0
+                if top_reason in {"size_below_min"} and top_ratio >= 0.6:
                     changed = self._apply_threshold_change(
                         "min_position_usd",
-                        -self.settings.auto_threshold_tune_step_min_usd,
+                        -self.settings.auto_threshold_tune_step_min_usd * step_mult,
                         self.settings.auto_threshold_tune_min_position_usd_min,
                         self.settings.auto_threshold_tune_min_position_usd_max,
                     )
                     if changed:
                         changes.append(f"MIN_POSITION_USD {changed[0]:.2f}->{changed[1]:.2f}")
-                if "price_below_min" in rejections or "min_contract_price" in rejections:
+                elif top_reason in {"price_below_min", "min_contract_price"} and top_ratio >= 0.6:
                     changed = self._apply_threshold_change(
                         "signal_min_contract_price",
-                        -self.settings.auto_threshold_tune_step_min_price,
+                        -self.settings.auto_threshold_tune_step_min_price * step_mult,
                         self.settings.auto_threshold_tune_min_contract_price_min,
                         self.settings.auto_threshold_tune_min_contract_price_max,
                     )
                     if changed:
                         changes.append(f"SIGNAL_MIN_CONTRACT_PRICE {changed[0]:.4f}->{changed[1]:.4f}")
-                if "score_below_threshold" in rejections or "net_ev_below_min" in rejections:
+                elif top_reason in {"score_below_threshold", "net_ev_below_min"} and top_ratio >= 0.6:
                     changed = self._apply_threshold_change(
                         "signal_min_net_ev",
-                        -self.settings.auto_threshold_tune_step_net_ev,
+                        -self.settings.auto_threshold_tune_step_net_ev * step_mult,
                         self.settings.auto_threshold_tune_min_net_ev,
                         self.settings.auto_threshold_tune_max_net_ev,
                     )
                     if changed:
                         changes.append(f"SIGNAL_MIN_NET_EV {changed[0]:.5f}->{changed[1]:.5f}")
+                elif top_reason in {"market_side_max_open", "market_side_max_open_recent"} and top_ratio >= 0.6:
+                    changes.append("CAPACITY_BLOCKED (market_side_max_open)")
+                else:
+                    if "size_below_min" in rejections:
+                        changed = self._apply_threshold_change(
+                            "min_position_usd",
+                            -self.settings.auto_threshold_tune_step_min_usd,
+                            self.settings.auto_threshold_tune_min_position_usd_min,
+                            self.settings.auto_threshold_tune_min_position_usd_max,
+                        )
+                        if changed:
+                            changes.append(f"MIN_POSITION_USD {changed[0]:.2f}->{changed[1]:.2f}")
+                    if "price_below_min" in rejections or "min_contract_price" in rejections:
+                        changed = self._apply_threshold_change(
+                            "signal_min_contract_price",
+                            -self.settings.auto_threshold_tune_step_min_price,
+                            self.settings.auto_threshold_tune_min_contract_price_min,
+                            self.settings.auto_threshold_tune_min_contract_price_max,
+                        )
+                        if changed:
+                            changes.append(f"SIGNAL_MIN_CONTRACT_PRICE {changed[0]:.4f}->{changed[1]:.4f}")
+                    if "score_below_threshold" in rejections or "net_ev_below_min" in rejections:
+                        changed = self._apply_threshold_change(
+                            "signal_min_net_ev",
+                            -self.settings.auto_threshold_tune_step_net_ev,
+                            self.settings.auto_threshold_tune_min_net_ev,
+                            self.settings.auto_threshold_tune_max_net_ev,
+                        )
+                        if changed:
+                            changes.append(f"SIGNAL_MIN_NET_EV {changed[0]:.5f}->{changed[1]:.5f}")
             elif fill_rate >= high and pnl is not None and pnl < 0:
                 changed = self._apply_threshold_change(
                     "signal_min_net_ev",
@@ -429,11 +475,15 @@ class TradingApp:
                 return
 
             self._last_auto_threshold_tune_at = datetime.now(timezone.utc)
+            reason_summary = "없음"
+            if top_reason and total_rejects > 0:
+                reason_summary = f"{top_reason} {top_ratio:.0%} ({top_count}/{total_rejects})"
             change_summary = "; ".join(changes)
             await self._notify(
                 (
                     "[자동 튜닝]\n"
                     f"윈도우 {minutes}m | FillRate {fill_rate:.2f} | Signals {signals} Fills {fills}\n"
+                    f"TopReject {reason_summary}\n"
                     f"{change_summary}"
                 )
             )

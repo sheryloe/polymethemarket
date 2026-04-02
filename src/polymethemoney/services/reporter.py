@@ -63,12 +63,11 @@ class ReporterService:
         fill_rate = summary["fill_rate"]
 
         return (
-            "[정기 리포트]\n"
-            f"시각 {now}\n"
-            f"모드 {mode_label} | 상태 {run_state} | 킬스위치 {kill_switch} | 실거래차단 {live_lock}\n"
-            f"포지션 {len(open_positions)}개(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 승인대기 {pending}건\n"
-            f"손익(일/주) {snapshot['day_pnl']:+.2f} / {snapshot['week_pnl']:+.2f} USD | 미실현 {unrealized_total:+.2f} USD\n"
-            f"60분: 신호 {summary['total_signals']} | 체결 {summary['filled_signals']} ({fill_rate:.0%}) | 거절 {reject_text}"
+            "[정기]\n"
+            f"{now} | {mode_label} {run_state} | Kill {kill_switch} | LiveLock {live_lock}\n"
+            f"포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 대기 {pending} | "
+            f"손익 D/W {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} | 미실현 {unrealized_total:+.2f}\n"
+            f"60분 신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({fill_rate:.0%}) | 거절 {reject_text}"
         )
 
     async def build_status_text(self) -> str:
@@ -98,15 +97,13 @@ class ReporterService:
         hist_mdd = hist_metrics.mdd_pct if hist_metrics is not None else 1.0
 
         return (
-            "[상태 요약]\n"
-            f"시각 {now}\n"
-            f"모드 {mode_label} | 상태 {run_state} | 킬스위치 {kill_switch} | 실거래차단 {live_lock}\n"
-            f"포지션 {len(open_positions)}개(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 승인대기 {pending}건\n"
-            f"손익(일/주) {snapshot['day_pnl']:+.2f} / {snapshot['week_pnl']:+.2f} USD | 미실현 {unrealized_total:+.2f} USD\n"
-            f"드로다운(일/주) {risk_state.daily_drawdown_pct:.2%} / {risk_state.weekly_drawdown_pct:.2%}\n"
-            f"60분: 신호 {summary_60m['total_signals']} | 체결 {summary_60m['filled_signals']} ({summary_60m['fill_rate']:.0%}) | 거절 {reject_text_60m}\n"
-            f"게이트: 히스토리 {hist_status}(window {hist_window}d, PF {hist_pf:.2f}, MDD {hist_mdd:.2%}) | "
-            f"페이퍼 {paper_status}(거래 {paper_metrics.trades}건)"
+            "[상태]\n"
+            f"{now} | {mode_label} {run_state} | Kill {kill_switch} | LiveLock {live_lock}\n"
+            f"포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 대기 {pending} | "
+            f"DD D/W {risk_state.daily_drawdown_pct:.2%}/{risk_state.weekly_drawdown_pct:.2%}\n"
+            f"손익 D/W {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} | 미실현 {unrealized_total:+.2f}\n"
+            f"60분 신호 {summary_60m['total_signals']} | 체결 {summary_60m['filled_signals']}({summary_60m['fill_rate']:.0%}) | 거절 {reject_text_60m}\n"
+            f"게이트 H {hist_status}({hist_window}d PF{hist_pf:.2f} MDD{hist_mdd:.2%}) | P {paper_status}(T{paper_metrics.trades})"
         )
 
     async def build_report60_text(self) -> str:
@@ -120,15 +117,11 @@ class ReporterService:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         body = (
-            "[60분 리포트]\n"
-            f"시각 {now}\n"
-            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']} ({summary['fill_rate']:.0%})\n"
-            f"YES/NO {summary['yes_signals']} / {summary['no_signals']}\n"
-            f"거절 Top3 {reject_text}\n"
-            f"NO 가드 Top3 {no_guard_text}\n"
-            f"실현손익(60분) {summary['realized_pnl']:+.2f} USD\n"
-            f"미실현(현재) {unrealized_total:+.2f} USD\n"
-            f"오픈 포지션 {snapshot['open_positions']}개(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
+            "[60분]\n"
+            f"{now}\n"
+            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
+            f"거절 {reject_text} | NO가드 {no_guard_text}\n"
+            f"실현 {summary['realized_pnl']:+.2f} | 미실현 {unrealized_total:+.2f} | 포지션 {snapshot['open_positions']}(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
         )
         if tune_message:
             return f"{body}\n\n{tune_message}"
@@ -143,15 +136,11 @@ class ReporterService:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         return (
-            "[6시간 리포트]\n"
-            f"시각 {now}\n"
-            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']} ({summary['fill_rate']:.0%})\n"
-            f"YES/NO {summary['yes_signals']} / {summary['no_signals']}\n"
-            f"거절 Top3 {reject_text}\n"
-            f"NO 가드 Top3 {no_guard_text}\n"
-            f"실현손익(6시간) {summary['realized_pnl']:+.2f} USD\n"
-            f"미실현(현재) {unrealized_total:+.2f} USD\n"
-            f"오픈 포지션 {len(open_positions)}개(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
+            "[6시간]\n"
+            f"{now}\n"
+            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
+            f"거절 {reject_text} | NO가드 {no_guard_text}\n"
+            f"실현 {summary['realized_pnl']:+.2f} | 미실현 {unrealized_total:+.2f} | 포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
         )
 
     async def maybe_apply_zero_fill_tuning(self) -> str | None:
