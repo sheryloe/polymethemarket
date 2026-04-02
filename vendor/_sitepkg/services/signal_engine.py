@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class SignalEngine:
     _YES_PRIORITY_POLICY = "YES_PRIORITY"
     _BALANCED_POLICY = "BALANCED"
+    _NO_RATIO_WINDOW = 300
 
     def __init__(
         self,
@@ -34,8 +35,9 @@ class SignalEngine:
         self._last_implied_prob_by_market: dict[str, float] = {}
         self._trend_deltas: deque[float] = deque(maxlen=max(60, self.settings.trend_window_size))
         self._last_signal_at_by_market_side: dict[tuple[str, str], datetime] = {}
+        self._recent_signal_sides: deque[str] = deque(maxlen=max(10, self.settings.signal_side_balance_window))
         self._recent_candidate_sides: deque[str] = deque(maxlen=max(20, self.settings.signal_side_balance_window))
-        self._recent_approved_sides: deque[str] = deque(maxlen=300)
+        self._recent_approved_sides: deque[str] = deque(maxlen=self._NO_RATIO_WINDOW)
 
     async def run(self) -> None:
         while True:
@@ -49,105 +51,63 @@ class SignalEngine:
         self._update_trend_state(fv)
         if not self._passes_liquidity_filter(fv):
             return self._reject_candidate("liquidity_filter")
-
-        prediction = self.model_engine.predict_dual_score(fv)
-        fair_yes = prediction.blended_prob
+        trend_bias, _ = self._trend_bias()
+        prediction = self.model_engine.predict(fv)
+        fair_yes = prediction.fair_probability
         model_confidence = prediction.confidence
         implied_yes = fv.implied_prob
         fair_yes = self._regime_shrunk_fair(fair_yes, implied_yes, fv, model_confidence)
-
         min_confidence = self._dynamic_min_confidence(fv)
         if model_confidence < min_confidence:
             return self._reject_candidate("min_confidence")
-
-        if model_confidence < self.settings.signal_min_confidence:
-            return self._reject_candidate("min_confidence")
-
-        quality = self._quality_score(fv, model_confidence)
-        if quality < self.settings.signal_min_quality:
-            return self._reject_candidate("min_quality")
-
         edge_yes = fair_yes - implied_yes
-        alpha_bonus = self._alpha_bonus(fv)
-        raw_yes = edge_yes + alpha_bonus
-        raw_no = -edge_yes - alpha_bonus
+        fair_no = 1.0 - fair_yes
+        implied_no = 1.0 - implied_yes
+        edge_no = fair_no - implied_no
 
-        raw_yes = self._risk_adjusted_edge(raw_yes, fv)
-        raw_no = self._risk_adjusted_edge(raw_no, fv)
-
-        effective_yes = self._effective_edge(raw_yes, model_confidence, quality, Side.YES, fv)
-        effective_no = self._effective_edge(raw_no, model_confidence, quality, Side.NO, fv)
-
+        risk_yes = self._risk_adjusted_edge(edge_yes, fv)
+        risk_no = self._risk_adjusted_edge(edge_no, fv)
+        effective_yes = self._build_effective_edge(Side.YES, fv, risk_yes, model_confidence)
+        effective_no = self._build_effective_edge(Side.NO, fv, risk_no, model_confidence)
         fee_cost = (self.settings.taker_fee_bps / 10000.0) * 0.5
         slippage_cost = self.settings.slippage_bps / 10000.0
         net_yes = effective_yes - fee_cost - slippage_cost
         net_no = effective_no - fee_cost - slippage_cost
-        trend_bias, trend_confidence = self._trend_bias()
 
-        side_policy = (self.settings.signal_side_policy or self._BALANCED_POLICY).strip().upper()
-        if side_policy == self._YES_PRIORITY_POLICY:
-            margin = max(0.0, self.settings.signal_yes_priority_margin)
-            if net_no >= net_yes + margin:
-                side = Side.NO
-                net_ev = net_no
-                effective_edge = effective_no
-                fair = 1.0 - fair_yes
-                implied = 1.0 - implied_yes
-                edge = -edge_yes
-            else:
-                side = Side.YES
-                net_ev = net_yes
-                effective_edge = effective_yes
-                fair = fair_yes
-                implied = implied_yes
-                edge = edge_yes
+        no_guard_reject = self._evaluate_no_guard(
+            net_ev=net_no,
+            model_confidence=model_confidence,
+            trend_bias=trend_bias,
+            orderbook_imbalance=fv.orderbook_imbalance,
+        )
+        side_policy = (self.settings.signal_side_policy or self._YES_PRIORITY_POLICY).strip().upper()
+        if side_policy == self._BALANCED_POLICY:
+            prefer_no = effective_no > effective_yes
         else:
-            if net_no > net_yes:
-                side = Side.NO
-                net_ev = net_no
-                effective_edge = effective_no
-                fair = 1.0 - fair_yes
-                implied = 1.0 - implied_yes
-                edge = -edge_yes
-            else:
-                side = Side.YES
-                net_ev = net_yes
-                effective_edge = effective_yes
-                fair = fair_yes
-                implied = implied_yes
-                edge = edge_yes
-            if self._should_force_no(
-                net_yes=net_yes,
-                net_no=net_no,
-                trend_bias=trend_bias,
-                trend_confidence=trend_confidence,
-                fv=fv,
-            ):
-                side = Side.NO
-                net_ev = net_no
-                effective_edge = effective_no
-                fair = 1.0 - fair_yes
-                implied = 1.0 - implied_yes
-                edge = -edge_yes
+            prefer_no = effective_no > effective_yes and no_guard_reject is None
+
+        if prefer_no:
+            side = Side.NO
+            edge = edge_no
+            implied = implied_no
+            fair = fair_no
+            effective_edge = effective_no
+            net_ev = net_no
+        else:
+            side = Side.YES
+            edge = edge_yes
+            implied = implied_yes
+            fair = fair_yes
+            effective_edge = effective_yes
+            net_ev = net_yes
+            if effective_no > effective_yes and no_guard_reject:
+                self._record_no_guard_reject(no_guard_reject)
 
         self._record_candidate_side(side.value)
         if not self._passes_time_to_expiry(fv, edge):
             return self._reject_candidate("time_to_expiry_guard")
-        if self.settings.signal_regime_mismatch_guard:
-            if (
-                side == Side.YES
-                and trend_confidence >= 0.40
-                and trend_bias <= -0.20
-                and net_yes < 0.0015
-            ):
-                return self._reject_candidate("regime_mismatch_yes")
-            if (
-                side == Side.NO
-                and trend_confidence >= 0.40
-                and trend_bias >= 0.20
-                and net_no < 0.0015
-            ):
-                return self._reject_candidate("regime_mismatch_no")
+        if self._is_dominant_side_hard_blocked(side):
+            return self._reject_candidate("dominant_side_hard_block")
         if self._mid_band_low_edge(implied, net_ev):
             return self._reject_candidate("mid_band_low_edge")
         if not self._passes_contract_price(implied):
@@ -157,11 +117,10 @@ class SignalEngine:
         if not self._passes_reentry_cooldown(fv.market_id, side):
             return self._reject_candidate("reentry_cooldown")
 
-        model_edge_score = self._edge_score(net_ev)
+        model_edge_score = max(0.0, min(45.0, (net_ev / max(1e-6, self.settings.signal_edge_score_scale)) * 45.0))
         liquidity_score = self._liquidity_score(fv)
         regime_score = self.model_engine.regime_score(fv)
-        quality_score = min(10.0, max(0.0, quality * 10.0))
-        score = int(round(model_edge_score + liquidity_score + regime_score + quality_score))
+        score = int(round(model_edge_score + liquidity_score + regime_score))
         score = max(0, min(100, score))
 
         signal = Signal(
@@ -180,52 +139,17 @@ class SignalEngine:
             effective_edge=effective_edge,
             created_at=datetime.now(timezone.utc),
         )
+        self._recent_signal_sides.append(side.value)
         self._record_candidate_accept(side.value)
         return signal
 
-    def _alpha_bonus(self, fv: FeatureVector) -> float:
-        trend_bias, trend_confidence = self._trend_bias()
-        trend_score = trend_bias * trend_confidence
-        revert_score = -fv.orderbook_imbalance
-        weighted = (
-            (self.settings.signal_alpha_trend_weight * trend_score)
-            + (self.settings.signal_alpha_revert_weight * revert_score)
-        )
-        cap = max(0.0, self.settings.signal_alpha_bonus_cap)
-        bonus = weighted * cap
-        return max(-cap, min(cap, bonus))
-
-    def _effective_edge(
-        self,
-        raw_edge: float,
-        model_confidence: float,
-        quality: float,
-        side: Side,
-        fv: FeatureVector,
-    ) -> float:
+    def _build_effective_edge(self, side: Side, fv: FeatureVector, raw_edge: float, model_confidence: float) -> float:
+        # Confidence-aware shrinkage to reduce overreaction on noisy estimates.
         effective = raw_edge * (0.4 + 0.6 * model_confidence)
+        effective = self._micro_revert_adjusted_edge(side, fv, effective)
         effective = self._trend_adjusted_edge(side, effective)
-        effective *= (0.5 + 0.5 * quality)
-        effective = self._side_balance_adjust(side, effective)
+        effective = self._side_balance_adjusted_edge(side, effective)
         return effective
-
-    def _edge_score(self, net_ev: float) -> float:
-        scale = max(1e-4, self.settings.signal_edge_score_scale)
-        score = (net_ev / scale) * 45.0
-        return max(0.0, min(45.0, score))
-
-    def _quality_score(self, fv: FeatureVector, model_confidence: float) -> float:
-        spread_penalty = min(1.0, fv.spread / max(self.settings.max_spread, 1e-6))
-        vol_ref = max(1e-4, self.settings.signal_vol_ref)
-        vol_penalty = min(1.0, fv.volatility_30 / vol_ref)
-        spread_weight = max(0.0, min(1.0, self.settings.signal_spread_penalty_weight))
-        vol_weight = max(0.0, min(1.0, self.settings.signal_vol_penalty_weight))
-        liquidity = self._liquidity_score(fv) / 30.0
-        quality = model_confidence
-        quality *= (1.0 - (spread_penalty * spread_weight))
-        quality *= (1.0 - (vol_penalty * vol_weight))
-        quality *= 0.7 + (0.3 * liquidity)
-        return max(0.0, min(1.0, quality))
 
     def _passes_net_ev_filter(self, implied: float, net_ev: float) -> bool:
         base_min = max(0.0, self.settings.signal_min_net_ev)
@@ -297,7 +221,8 @@ class SignalEngine:
             return
         liquidity_weight = min(
             1.5,
-            0.5 + (fv.volume_1h / max(self.settings.min_hourly_volume_usd * 2.0, 1.0)),
+            0.5
+            + (fv.volume_1h / max(self.settings.min_hourly_volume_usd * 2.0, 1.0)),
         )
         self._trend_deltas.append(delta * liquidity_weight)
 
@@ -371,59 +296,86 @@ class SignalEngine:
         bump = max(0.0, self.settings.signal_vol_confidence_penalty) * vol_penalty
         return min(0.95, base + bump)
 
-    def _side_balance_adjust(self, side: Side, edge: float) -> float:
-        if not self.settings.signal_side_balance_enabled:
-            return edge
-        window = max(10, int(self.settings.signal_side_balance_window))
-        if len(self._recent_candidate_sides) < min(20, window):
-            return edge
-        yes_count = sum(1 for s in self._recent_candidate_sides if s == "YES")
-        no_count = sum(1 for s in self._recent_candidate_sides if s == "NO")
-        total = yes_count + no_count
-        if total <= 0:
-            return edge
-        yes_ratio = yes_count / total
-        no_ratio = no_count / total
-        dominant = "YES" if yes_ratio >= no_ratio else "NO"
-        ratio = max(yes_ratio, no_ratio)
-        if ratio <= self.settings.signal_max_side_ratio:
-            return edge
-        if side.value == dominant:
-            penalty = max(0.0, min(0.9, self.settings.signal_dominant_side_penalty))
-            return edge * (1.0 - penalty)
-        return edge
-
-    def _should_force_no(
+    def _evaluate_no_guard(
         self,
-        net_yes: float,
-        net_no: float,
+        net_ev: float,
+        model_confidence: float,
         trend_bias: float,
-        trend_confidence: float,
-        fv: FeatureVector,
-    ) -> bool:
-        window = max(20, int(self.settings.signal_force_no_window))
-        min_ratio = max(0.0, min(0.5, self.settings.signal_force_no_min_ratio))
-        if len(self._recent_approved_sides) >= min(40, window // 2):
-            recent = list(self._recent_approved_sides)[-window:]
+        orderbook_imbalance: float,
+    ) -> str | None:
+        if net_ev < self.settings.signal_no_min_net_ev:
+            return "no_guard_net_ev"
+        if model_confidence < self.settings.signal_no_min_confidence:
+            return "no_guard_confidence"
+        trend_ok = trend_bias <= self.settings.signal_no_regime_trend_bias
+        imbalance_ok = orderbook_imbalance <= self.settings.signal_no_regime_imbalance
+        if not (trend_ok or imbalance_ok):
+            return "no_guard_regime"
+        total = len(self._recent_approved_sides)
+        if total >= 20:
+            no_count = sum(1 for side in self._recent_approved_sides if side == Side.NO.value)
+            projected_ratio = (no_count + 1) / max(1, total + 1)
+            ratio_cap = max(0.05, min(0.95, self.settings.signal_no_max_ratio))
+            if projected_ratio > ratio_cap:
+                return "no_guard_ratio"
+        return None
+
+    def _micro_revert_adjusted_edge(self, side: Side, fv: FeatureVector, effective_edge: float) -> float:
+        if not self.settings.micro_revert_enabled:
+            return effective_edge
+        if fv.volatility_30 > self.settings.micro_revert_max_vol:
+            return effective_edge
+        threshold = max(0.01, self.settings.micro_revert_imb_threshold)
+        if abs(fv.orderbook_imbalance) < threshold:
+            return effective_edge
+        preferred_side = Side.NO if fv.orderbook_imbalance > 0 else Side.YES
+        boost = max(0.0, min(0.6, self.settings.micro_revert_boost))
+        if side == preferred_side:
+            multiplier = 1.0 + boost
         else:
-            recent = list(self._recent_candidate_sides)[-window:]
-            if len(recent) < min(20, window // 2):
-                return False
-        no_count = sum(1 for side in recent if side == "NO")
-        total = max(1, len(recent))
-        no_ratio = no_count / total
-        if no_ratio >= min_ratio:
+            multiplier = 1.0 - (boost * 0.8)
+        multiplier = max(0.35, min(1.75, multiplier))
+        return effective_edge * multiplier
+
+    def _side_balance_adjusted_edge(self, side: Side, effective_edge: float) -> float:
+        if not self.settings.signal_side_balance_enabled:
+            return effective_edge
+        if self.settings.signal_dominant_side_hard_block:
+            return effective_edge
+        dominant_side, dominant_ratio = self._dominant_side_ratio()
+        if dominant_side is None:
+            return effective_edge
+        ratio_cap = max(0.5, min(0.99, self.settings.signal_max_side_ratio))
+        if dominant_ratio <= ratio_cap:
+            return effective_edge
+        if side.value != dominant_side:
+            return effective_edge
+        penalty = max(0.0, min(0.95, self.settings.signal_dominant_side_penalty))
+        # Prevent near-zero collapse that can stall signal flow when penalty is set too high.
+        return effective_edge * max(0.25, 1.0 - penalty)
+
+    def _is_dominant_side_hard_blocked(self, side: Side) -> bool:
+        if not self.settings.signal_side_balance_enabled:
             return False
-        if net_no < max(self.settings.signal_force_no_min_net_ev, self.settings.signal_min_net_ev):
+        if not self.settings.signal_dominant_side_hard_block:
             return False
-        if net_no + self.settings.signal_force_no_margin < net_yes:
+        dominant_side, dominant_ratio = self._dominant_side_ratio()
+        if dominant_side is None:
             return False
-        trend_ok = (
-            trend_confidence >= self.settings.signal_force_no_trend_confidence
-            and trend_bias <= self.settings.signal_force_no_trend_bias
-        )
-        imbalance_ok = fv.orderbook_imbalance <= self.settings.signal_force_no_imbalance
-        return trend_ok or imbalance_ok
+        ratio_cap = max(0.5, min(0.99, self.settings.signal_max_side_ratio))
+        return dominant_ratio > ratio_cap and side.value == dominant_side
+
+    def _dominant_side_ratio(self) -> tuple[str | None, float]:
+        window = max(20, self.settings.signal_side_balance_window)
+        history = list(self._recent_candidate_sides)[-window:]
+        total = len(history)
+        if total < 20:
+            return None, 0.0
+        yes_count = sum(1 for value in history if value == Side.YES.value)
+        no_count = total - yes_count
+        dominant_side = Side.YES.value if yes_count >= no_count else Side.NO.value
+        dominant_ratio = max(yes_count, no_count) / max(1, total)
+        return dominant_side, dominant_ratio
 
     def _record_candidate_side(self, side: str) -> None:
         self._recent_candidate_sides.append(side)
@@ -439,8 +391,10 @@ class SignalEngine:
     def _reject_candidate(self, reason: str) -> Signal | None:
         if self.runtime_state is not None:
             self.runtime_state.recent_signal_candidate_rejects.append(reason)
-            if reason.startswith("no_guard"):
-                self.runtime_state.recent_no_guard_rejects.append(
-                    TimedReasonEvent(timestamp=datetime.now(timezone.utc), reason=reason)
-                )
         return None
+
+    def _record_no_guard_reject(self, reason: str) -> None:
+        if self.runtime_state is not None:
+            self.runtime_state.recent_no_guard_rejects.append(
+                TimedReasonEvent(timestamp=datetime.now(timezone.utc), reason=reason)
+            )

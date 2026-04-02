@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from polymethemoney.adapters.paper_exchange import PaperExchange
@@ -53,14 +53,9 @@ class ExecutionEngine:
         await self.store.add_signal(signal)
         self.runtime_state.recent_signals.append(signal)
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
-        max_per_side = max(1, self.settings.max_open_per_market_side)
-        if self._open_same_market_side_count(open_positions, signal) >= max_per_side:
-            rotated = await self._rotate_market_side_if_needed(signal, open_positions, max_per_side)
-            if rotated:
-                open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
-            if self._open_same_market_side_count(open_positions, signal) >= max_per_side:
-                await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open")
-                return
+        if self._open_same_market_side_count(open_positions, signal) >= max(1, self.settings.max_open_per_market_side):
+            await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open")
+            return
         structure_open = await self.store.structure_open_legs_count()
         decision = await self.risk_engine.decide(signal, len(open_positions) + structure_open)
         if decision.kind == DecisionType.REJECT:
@@ -526,84 +521,3 @@ class ExecutionEngine:
             for row in open_positions
             if str(getattr(row, "market_id", "")) == market_id and str(getattr(row, "side", "")).upper() == side
         )
-
-    async def _rotate_market_side_if_needed(
-        self,
-        signal: Signal,
-        open_positions: list,
-        max_per_side: int,
-    ) -> bool:
-        if not self.settings.market_side_rotation_enabled:
-            return False
-        mode = self.runtime_state.trading_mode
-        if mode != TradingMode.PAPER:
-            return False
-        market_id = str(signal.market_id)
-        side = signal.side.value.upper()
-        candidates = [
-            row
-            for row in open_positions
-            if str(getattr(row, "market_id", "")) == market_id and str(getattr(row, "side", "")).upper() == side
-        ]
-        if len(candidates) < max_per_side:
-            return False
-
-        now = datetime.now(timezone.utc)
-        min_age = timedelta(minutes=max(0, int(self.settings.market_side_rotation_min_age_minutes)))
-        eligible = [
-            row
-            for row in candidates
-            if getattr(row, "opened_at", None) is None or (now - row.opened_at) >= min_age
-        ]
-        if not eligible:
-            await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open_recent")
-            return False
-
-        eligible.sort(key=lambda row: getattr(row, "opened_at", now) or now)
-        required_close = (len(candidates) - max_per_side) + 1
-        required_close = max(1, required_close)
-        to_close = eligible[:required_close]
-
-        latest_prices = await self.store.latest_market_prices([market_id])
-        yes_price = latest_prices.get(market_id)
-        if yes_price is None:
-            return False
-
-        closed_count = 0
-        realized_total = 0.0
-        for row in to_close:
-            mark_price = (1.0 - float(yes_price)) if side == "NO" else float(yes_price)
-            mark_price = max(0.001, min(0.999, mark_price))
-            closed = await self.store.close_position_at_mark(
-                position_id=int(row.id),
-                mark_price=mark_price,
-                mode=mode,
-            )
-            if closed is None:
-                continue
-            realized = float(closed["realized_pnl_usd"])
-            order_id = f"rotate-{int(row.id)}-{int(now.timestamp())}"
-            await self.store.add_fill(
-                order_id=order_id,
-                market_id=market_id,
-                side=side,
-                fill_price=float(closed["exit_price"]),
-                size_usd=float(closed["size_usd"]),
-                fee_usd=0.0,
-                pnl_usd=realized,
-                trading_mode=mode,
-            )
-            if realized != 0.0:
-                await self.gatekeeper.register_paper_trade(realized, when=now)
-            realized_total += realized
-            closed_count += 1
-
-        if closed_count > 0:
-            await self.risk_engine.refresh_state()
-            await self.notify_fn(
-                "[포지션 로테이션]\n"
-                f"시장 {market_id} | 방향 {side}\n"
-                f"청산 {closed_count} | 실현손익 {realized_total:+.2f} USD"
-            )
-            return True
-        return False

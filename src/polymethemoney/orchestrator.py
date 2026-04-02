@@ -276,7 +276,11 @@ class TradingApp:
             pnl_usd = performance["pnl_usd"]
             trades = performance["trades"]
             target = self.settings.paper_perf_tune_target.lower()
-            trigger = pnl_usd <= self.settings.paper_perf_tune_min_pnl_usd and trades >= self.settings.paper_perf_tune_min_trades
+            trigger_on_negative = bool(self.settings.paper_perf_tune_trigger_on_negative)
+            if trigger_on_negative:
+                trigger = pnl_usd < 0 and trades >= self.settings.paper_perf_tune_min_trades
+            else:
+                trigger = pnl_usd <= self.settings.paper_perf_tune_min_pnl_usd and trades >= self.settings.paper_perf_tune_min_trades
 
             if not trigger:
                 return
