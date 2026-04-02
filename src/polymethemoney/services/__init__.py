@@ -13,6 +13,9 @@ class _ServicePycFinder(MetaPathFinder):
         if not fullname.startswith(__name__ + "."):
             return None
         mod = fullname.rsplit(".", 1)[-1]
+        py = Path(__file__).with_name(f"{mod}.py")
+        if py.exists():
+            return None
         pyc = _PYC_DIR / f"{mod}.cpython-312.pyc"
         if not pyc.exists():
             return None
