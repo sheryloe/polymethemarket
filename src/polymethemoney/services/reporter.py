@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from polymethemoney.config import Settings
+from polymethemoney.domain import STRATEGY_MODEL_A, STRATEGY_MODEL_B
 from polymethemoney.services.gatekeeper import Gatekeeper
 from polymethemoney.services.risk_engine import RiskEngine
 from polymethemoney.state import RuntimeState, TimedReasonEvent
@@ -32,20 +33,22 @@ class ReporterService:
         self.notify_fn = notify_fn
 
     async def run_periodic(self) -> None:
-        interval_sec = max(60, self.settings.report_interval_minutes * 60)
-        await self.send_report()
+        interval_sec = max(60, int(self.settings.report_interval_minutes) * 60)
         while True:
             await asyncio.sleep(interval_sec)
             await self.send_report()
 
     async def send_report(self) -> None:
-        tune_message = await self.maybe_apply_zero_fill_tuning()
-        if tune_message:
-            await self.notify_fn(tune_message)
-        text = await self.build_periodic_text()
+        if self.settings.ab_test_enabled:
+            text = await self.build_report30_text()
+        else:
+            text = await self.build_report60_text(include_tune=False)
         await self.notify_fn(text)
 
     async def build_periodic_text(self) -> str:
+        if self.settings.ab_test_enabled:
+            return await self.build_report30_text()
+
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         snapshot = await self.store.status_snapshot()
         await self.risk_engine.refresh_state()
@@ -54,23 +57,24 @@ class ReporterService:
         _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
 
         mode_label = self.runtime_state.trading_mode.value.upper()
-        run_state = "일시정지" if self.runtime_state.paused else "운영중"
-        kill_switch = "ON" if self.runtime_state.kill_switch else "OFF"
+        run_state = "중지" if self.runtime_state.paused else "운영"
         live_lock = "ON" if self.settings.demo_paper_hardlock else "OFF"
         pending = len(self.runtime_state.pending_approvals)
-
         reject_text = self._format_reject_top(summary.get("reject_top", []))
         fill_rate = summary["fill_rate"]
 
         return (
-            "[정기]\n"
-            f"{now} | {mode_label} {run_state} | Kill {kill_switch} | LiveLock {live_lock}\n"
-            f"포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 대기 {pending} | "
-            f"손익 D/W {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} | 미실현 {unrealized_total:+.2f}\n"
-            f"60분 신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({fill_rate:.0%}) | 거절 {reject_text}"
+            "[10분 누적]\n"
+            f"{now} | 모드 {mode_label} | 상태 {run_state} | 하드락 {live_lock}\n"
+            f"오픈 포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 승인대기 {pending}\n"
+            f"일/주 손익 {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} USD | 미실현 {unrealized_total:+.2f} USD\n"
+            f"최근 60분 신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({fill_rate:.0%}) | 거절 {reject_text}"
         )
 
     async def build_status_text(self) -> str:
+        if self.settings.ab_test_enabled:
+            return await self._build_ab_status_text()
+
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         snapshot = await self.store.status_snapshot()
         risk_state = await self.risk_engine.refresh_state()
@@ -78,87 +82,57 @@ class ReporterService:
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
         _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
 
-        hist_ok = await self.gatekeeper.historical_gate_passed()
-        paper_ok = await self.gatekeeper.paper_gate_passed()
-        paper_metrics = await self.gatekeeper.paper_metrics()
-        hist_metrics = self.gatekeeper.historical_metrics
-
         mode_label = self.runtime_state.trading_mode.value.upper()
-        run_state = "일시정지" if self.runtime_state.paused else "운영중"
-        kill_switch = "ON" if self.runtime_state.kill_switch else "OFF"
+        run_state = "중지" if self.runtime_state.paused else "운영"
         live_lock = "ON" if self.settings.demo_paper_hardlock else "OFF"
         pending = len(self.runtime_state.pending_approvals)
         reject_text_60m = self._format_reject_top(summary_60m.get("reject_top", []))
 
-        hist_status = "통과" if hist_ok else "실패"
-        paper_status = "통과" if paper_ok else "실패"
-        hist_window = hist_metrics.window_days if hist_metrics is not None else 0
-        hist_pf = hist_metrics.pf if hist_metrics is not None else 0.0
-        hist_mdd = hist_metrics.mdd_pct if hist_metrics is not None else 1.0
-
         return (
-            "[상태]\n"
-            f"{now} | {mode_label} {run_state} | Kill {kill_switch} | LiveLock {live_lock}\n"
-            f"포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 대기 {pending} | "
-            f"DD D/W {risk_state.daily_drawdown_pct:.2%}/{risk_state.weekly_drawdown_pct:.2%}\n"
-            f"손익 D/W {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} | 미실현 {unrealized_total:+.2f}\n"
-            f"60분 신호 {summary_60m['total_signals']} | 체결 {summary_60m['filled_signals']}({summary_60m['fill_rate']:.0%}) | 거절 {reject_text_60m}\n"
-            f"게이트 H {hist_status}({hist_window}d PF{hist_pf:.2f} MDD{hist_mdd:.2%}) | P {paper_status}(T{paper_metrics.trades})"
+            "[상태 요약]\n"
+            f"{now} | 모드 {mode_label} | 상태 {run_state} | 하드락 {live_lock}\n"
+            f"오픈 포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 승인대기 {pending}\n"
+            f"DD 일/주 {risk_state.daily_drawdown_pct:.2%}/{risk_state.weekly_drawdown_pct:.2%}\n"
+            f"일/주 손익 {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} USD | 미실현 {unrealized_total:+.2f} USD\n"
+            f"최근 60분 신호 {summary_60m['total_signals']} | 체결 {summary_60m['filled_signals']}({summary_60m['fill_rate']:.0%}) | 거절 {reject_text_60m}"
         )
 
-    async def build_report60_text(self) -> str:
-        tune_message = await self.maybe_apply_zero_fill_tuning()
-        summary = await self.store.signal_window_summary(window_minutes=60)
-        snapshot = await self.store.status_snapshot()
-        open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
-        _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
-        reject_text = self._format_reject_top(summary.get("reject_top", []))
-        no_guard_text = self._format_no_guard_top(window_minutes=60)
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    async def build_report30_text(self) -> str:
+        if not self.settings.ab_test_enabled:
+            return await self._build_single_report(window_minutes=30, title="[30분 누적]")
+        return await self._build_ab_compare_text(window_minutes=30, title="[30분 A/B 비교]")
 
-        body = (
-            "[60분]\n"
-            f"{now}\n"
-            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
-            f"거절 {reject_text} | NO가드 {no_guard_text}\n"
-            f"실현 {summary['realized_pnl']:+.2f} | 미실현 {unrealized_total:+.2f} | 포지션 {snapshot['open_positions']}(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
-        )
+    async def build_report60_text(self, include_tune: bool = True) -> str:
+        if self.settings.ab_test_enabled:
+            return await self._build_ab_compare_text(window_minutes=60, title="[60분 A/B 비교]")
+
+        tune_message = None
+        if include_tune:
+            tune_message = await self.maybe_apply_zero_fill_tuning()
+        body = await self._build_single_report(window_minutes=60, title="[60분 누적]")
         if tune_message:
             return f"{body}\n\n{tune_message}"
         return body
 
     async def build_report6h_text(self) -> str:
-        summary = await self.store.signal_window_summary(window_minutes=360)
-        open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
-        _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
-        reject_text = self._format_reject_top(summary.get("reject_top", []))
-        no_guard_text = self._format_no_guard_top(window_minutes=360)
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        return (
-            "[6시간]\n"
-            f"{now}\n"
-            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
-            f"거절 {reject_text} | NO가드 {no_guard_text}\n"
-            f"실현 {summary['realized_pnl']:+.2f} | 미실현 {unrealized_total:+.2f} | 포지션 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
-        )
+        if self.settings.ab_test_enabled:
+            return await self._build_ab_compare_text(window_minutes=360, title="[6시간 A/B 비교]")
+        return await self._build_single_report(window_minutes=360, title="[6시간 누적]")
 
     async def maybe_apply_zero_fill_tuning(self) -> str | None:
+        if self.settings.ab_test_enabled:
+            return None
         now = datetime.now(timezone.utc)
         self.runtime_state.auto_tune_zero_fill_last_checked_at = now
         if not self.settings.auto_tune_zero_fill_enabled:
-            return self._build_tune_notice("disabled", now, "자동 튜닝 비활성")
+            return self._build_tune_notice("disabled", now, "자동 튜닝 비활성화")
 
         summary = await self.store.signal_window_summary(window_minutes=self.settings.auto_tune_window_minutes)
         total_signals = int(summary["total_signals"])
         filled = int(summary["filled_signals"])
         min_signals = max(1, int(self.settings.auto_tune_min_signals))
         if total_signals < min_signals:
-            return self._build_tune_notice(
-                "insufficient_signals",
-                now,
-                f"신호 부족({total_signals}/{min_signals})",
-            )
+            return self._build_tune_notice("insufficient_signals", now, f"신호 부족 ({total_signals}/{min_signals})")
         if filled > 0:
             return self._build_tune_notice("has_fills", now, f"체결 존재 ({filled}건)")
         if self.settings.auto_tune_apply_once and self.runtime_state.auto_tune_zero_fill_applied:
@@ -170,7 +144,7 @@ class ReporterService:
             return self._build_tune_notice(
                 "target_not_lower",
                 now,
-                f"하향 여지 없음 (base {base_min:.2f} / target {target_min:.2f})",
+                f"목표 최소금액이 기존보다 낮지 않음 (base {base_min:.2f} / target {target_min:.2f})",
             )
 
         self.runtime_state.min_position_usd_override = target_min
@@ -179,7 +153,78 @@ class ReporterService:
         return self._build_tune_notice(
             "applied",
             now,
-            f"체결 0 지속으로 최소 진입금액 하향 {base_min:.2f} -> {target_min:.2f} USD",
+            f"무체결 감지: 최소금액 조정 {base_min:.2f} -> {target_min:.2f} USD",
+        )
+
+    async def _build_ab_status_text(self) -> str:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        risk_state = await self.risk_engine.refresh_state()
+        mode_label = self.runtime_state.trading_mode.value.upper()
+        run_state = "중지" if self.runtime_state.paused else "운영"
+        live_lock = "ON" if self.settings.demo_paper_hardlock else "OFF"
+        metrics_a = await self._ab_strategy_metrics(STRATEGY_MODEL_A, window_minutes=60)
+        metrics_b = await self._ab_strategy_metrics(STRATEGY_MODEL_B, window_minutes=60)
+
+        return (
+            "[상태 요약]\n"
+            f"{now} | 모드 {mode_label} | 상태 {run_state} | 하드락 {live_lock}\n"
+            f"DD 일/주 {risk_state.daily_drawdown_pct:.2%}/{risk_state.weekly_drawdown_pct:.2%}\n"
+            f"모델 A 오픈 {metrics_a['open_positions']} | 누적 {metrics_a['total_pnl']:+.2f} USD ({metrics_a['return_rate']:+.2%}) | 승률 {metrics_a['win_rate']:.0%}\n"
+            f"모델 B 오픈 {metrics_b['open_positions']} | 누적 {metrics_b['total_pnl']:+.2f} USD ({metrics_b['return_rate']:+.2%}) | 승률 {metrics_b['win_rate']:.0%}\n"
+            f"최근 60분 우위 {self._leader_text(metrics_a['window_total_pnl'], metrics_b['window_total_pnl'])} | 누적 우위 {self._leader_text(metrics_a['total_pnl'], metrics_b['total_pnl'])}"
+        )
+
+    async def _build_ab_compare_text(self, window_minutes: int, title: str) -> str:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        metrics_a = await self._ab_strategy_metrics(STRATEGY_MODEL_A, window_minutes=window_minutes)
+        metrics_b = await self._ab_strategy_metrics(STRATEGY_MODEL_B, window_minutes=window_minutes)
+        return (
+            f"{title}\n"
+            f"{now}\n"
+            f"모델 A | 신호 {metrics_a['signals']} | 체결 {metrics_a['fills']}({metrics_a['fill_rate']:.0%}) | 실현 {metrics_a['realized_pnl']:+.2f} | 미실현 {metrics_a['unrealized_pnl']:+.2f} | 승률 {metrics_a['win_rate']:.0%} | 오픈 {metrics_a['open_positions']}\n"
+            f"모델 B | 신호 {metrics_b['signals']} | 체결 {metrics_b['fills']}({metrics_b['fill_rate']:.0%}) | 실현 {metrics_b['realized_pnl']:+.2f} | 미실현 {metrics_b['unrealized_pnl']:+.2f} | 승률 {metrics_b['win_rate']:.0%} | 오픈 {metrics_b['open_positions']}\n"
+            f"최근 {window_minutes}분 우위 {self._leader_text(metrics_a['window_total_pnl'], metrics_b['window_total_pnl'])}\n"
+            f"누적 우위 {self._leader_text(metrics_a['total_pnl'], metrics_b['total_pnl'])}"
+        )
+
+    async def _ab_strategy_metrics(self, strategy_id: str, window_minutes: int) -> dict[str, float | int]:
+        summary = await self.store.signal_window_summary(window_minutes=window_minutes, strategy_id=strategy_id)
+        snapshot = await self.store.status_snapshot(strategy_id=strategy_id)
+        open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode, strategy_id=strategy_id)
+        _, unrealized_total, _, _, _ = await self._position_pnl_stats(open_positions)
+        capital = float(self.settings.model_portfolio_starting_capital_usd)
+        total_pnl = float(snapshot["total_pnl"]) + unrealized_total
+        return {
+            "signals": int(summary["total_signals"]),
+            "fills": int(summary["filled_signals"]),
+            "fill_rate": float(summary["fill_rate"]),
+            "realized_pnl": float(summary["realized_pnl"]),
+            "unrealized_pnl": float(unrealized_total),
+            "open_positions": int(snapshot["open_positions"]),
+            "win_rate": float(summary["win_rate"]),
+            "window_total_pnl": float(summary["realized_pnl"]) + float(unrealized_total),
+            "total_pnl": total_pnl,
+            "return_rate": total_pnl / max(1.0, capital),
+        }
+
+    async def _build_single_report(self, window_minutes: int, title: str) -> str:
+        summary = await self.store.signal_window_summary(window_minutes=window_minutes)
+        snapshot = await self.store.status_snapshot()
+        open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
+        _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
+        reject_text = self._format_reject_top(summary.get("reject_top", []))
+        no_guard_text = self._format_no_guard_top(window_minutes=window_minutes)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        label = f"{window_minutes}분"
+        if title == "[6시간 누적]":
+            label = "6시간"
+        return (
+            f"{title}\n"
+            f"{now}\n"
+            f"신호 {summary['total_signals']} | 체결 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
+            f"거절 {reject_text} | NO 가드 {no_guard_text}\n"
+            f"실현 {summary['realized_pnl']:+.2f} | 미실현 {unrealized_total:+.2f} | 오픈 포지션 {snapshot['open_positions']}(+{pos_plus}/0:{pos_flat}/-{pos_minus})\n"
+            f"{label} 승률 {float(summary['win_rate']):.0%}"
         )
 
     async def _position_pnl_stats(self, open_positions: list) -> tuple[list[str], float, int, int, int]:
@@ -209,6 +254,13 @@ class ReporterService:
             )
         return lines, unrealized_total, pos_plus, pos_flat, pos_minus
 
+    def _leader_text(self, pnl_a: float, pnl_b: float) -> str:
+        if abs(pnl_a - pnl_b) < 1e-9:
+            return f"동률 (A {pnl_a:+.2f} / B {pnl_b:+.2f} USD)"
+        if pnl_a > pnl_b:
+            return f"모델 A (A {pnl_a:+.2f} / B {pnl_b:+.2f} USD)"
+        return f"모델 B (A {pnl_a:+.2f} / B {pnl_b:+.2f} USD)"
+
     def _build_tune_notice(self, outcome: str, now: datetime, detail: str) -> str | None:
         if self.runtime_state.auto_tune_zero_fill_last_outcome == outcome:
             return None
@@ -218,8 +270,8 @@ class ReporterService:
             "[자동 튜닝]\n"
             f"윈도우 {self.settings.auto_tune_window_minutes}분\n"
             f"결과 {outcome}\n"
-            f"사유 {detail}\n"
-            f"점검시각 {checked_at}"
+            f"상세 {detail}\n"
+            f"확인 {checked_at}"
         )
 
     def _format_reject_top(self, reject_top: object) -> str:

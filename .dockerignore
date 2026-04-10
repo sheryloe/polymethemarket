@@ -1,0 +1,11 @@
+.git
+.codex
+.docker
+data
+docs
+tests
+__pycache__/
+*.pyc
+vendor/mirofish-oauthbridge
+vendor/awesome-codex-subagents
+.env

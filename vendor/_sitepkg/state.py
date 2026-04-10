@@ -31,7 +31,6 @@ class TimedReasonEvent:
 class RuntimeState:
     trading_mode: TradingMode = TradingMode.PAPER
     paused: bool = False
-    kill_switch: bool = False
     manual_live_approved: bool = False
     pending_approvals: dict[str, OrderIntent] = field(default_factory=dict)
     recent_signals: Deque[Signal] = field(default_factory=lambda: deque(maxlen=30))

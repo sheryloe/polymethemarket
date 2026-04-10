@@ -32,76 +32,37 @@ class ReporterService:
         self.notify_fn = notify_fn
 
     async def run_periodic(self) -> None:
-        interval_sec = max(60, self.settings.report_interval_minutes * 60)
+        interval_sec = max(60, int(self.settings.report_interval_minutes) * 60)
         await self.send_report()
         while True:
             await asyncio.sleep(interval_sec)
             await self.send_report()
 
     async def send_report(self) -> None:
-        tune_message = await self.maybe_apply_zero_fill_tuning()
-        if tune_message:
-            await self.notify_fn(tune_message)
-        text = await self.build_periodic_text()
+        text = await self.build_report60_text(include_tune=False)
         await self.notify_fn(text)
 
     async def build_periodic_text(self) -> str:
-        now = datetime.now(timezone.utc).strftime("%m-%d %H:%M UTC")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         snapshot = await self.store.status_snapshot()
         await self.risk_engine.refresh_state()
+        summary = await self.store.signal_window_summary(window_minutes=60)
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
         _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
 
         mode_label = self.runtime_state.trading_mode.value.upper()
-        run_state = "일시정지" if self.runtime_state.paused else "운영중"
+        run_state = "\uc911\uc9c0" if self.runtime_state.paused else "\uc6b4\uc601"
         live_lock = "ON" if self.settings.demo_paper_hardlock else "OFF"
+        pending = len(self.runtime_state.pending_approvals)
+        reject_text = self._format_reject_top(summary.get("reject_top", []))
+        fill_rate = summary["fill_rate"]
 
         return (
-            "[정기 리포트]\n"
-            f"{now} | {mode_label} {run_state} | 실거래차단 {live_lock}\n"
-            f"포지션 {len(open_positions)}개(+{pos_plus}/0:{pos_flat}/-{pos_minus})\n"
-            f"실현손익(일간) {snapshot['day_pnl']:+.2f} USD\n"
-            f"누적손익(주간) {snapshot['week_pnl']:+.2f} USD\n"
-            f"미실현손익 {unrealized_total:+.2f} USD"
-        )
-
-    async def maybe_apply_zero_fill_tuning(self) -> str | None:
-        now = datetime.now(timezone.utc)
-        self.runtime_state.auto_tune_zero_fill_last_checked_at = now
-        if not self.settings.auto_tune_zero_fill_enabled:
-            return self._build_tune_notice("disabled", now, "자동 튜닝 비활성")
-
-        summary = await self.store.signal_window_summary(window_minutes=self.settings.auto_tune_window_minutes)
-        total_signals = int(summary["total_signals"])
-        filled = int(summary["filled_signals"])
-        min_signals = max(1, int(self.settings.auto_tune_min_signals))
-        if total_signals < min_signals:
-            return self._build_tune_notice(
-                "insufficient_signals",
-                now,
-                f"신호 부족 ({total_signals}/{min_signals})",
-            )
-        if filled > 0:
-            return self._build_tune_notice("has_fills", now, f"체결 존재 ({filled}건)")
-        if self.settings.auto_tune_apply_once and self.runtime_state.auto_tune_zero_fill_applied:
-            return self._build_tune_notice("already_applied", now, "이미 1회 적용됨")
-
-        base_min = float(self.settings.min_position_usd)
-        target_min = max(0.1, float(self.settings.auto_tune_min_position_usd))
-        if target_min >= base_min:
-            return self._build_tune_notice(
-                "target_not_lower",
-                now,
-                f"하향 대상 없음 (base {base_min:.2f} / target {target_min:.2f})",
-            )
-
-        self.runtime_state.min_position_usd_override = target_min
-        self.runtime_state.auto_tune_zero_fill_applied = True
-        self.runtime_state.auto_tune_zero_fill_applied_at = now
-        return self._build_tune_notice(
-            "applied",
-            now,
-            f"체결 0 지속으로 최소 진입금액 하향 {base_min:.2f} -> {target_min:.2f} USD",
+            "[10\ubd84 \ub204\uc801]\n"
+            f"{now} | \ubaa8\ub4dc {mode_label} | \uc0c1\ud0dc {run_state} | \ud558\ub4dc\ub77d {live_lock}\n"
+            f"\uc624\ud508 \ud3ec\uc9c0\uc158 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | \uc2b9\uc778\ub300\uae30 {pending}\n"
+            f"\uc77c/\uc8fc \uc190\uc775 {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} USD | \ubbf8\uc2e4\ud604 {unrealized_total:+.2f} USD\n"
+            f"\ucd5c\uadfc 60\ubd84 \uc2e0\ud638 {summary['total_signals']} | \uccb4\uacb0 {summary['filled_signals']}({fill_rate:.0%}) | \uac70\uc808 {reject_text}"
         )
 
     async def build_status_text(self) -> str:
@@ -112,118 +73,101 @@ class ReporterService:
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
         _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
 
-        hist_ok = await self.gatekeeper.historical_gate_passed()
-        paper_ok = await self.gatekeeper.paper_gate_passed()
-        paper_metrics = await self.gatekeeper.paper_metrics()
-        hist_metrics = self.gatekeeper.historical_metrics
-
         mode_label = self.runtime_state.trading_mode.value.upper()
-        run_state = "일시정지" if self.runtime_state.paused else "운영중"
-        kill_switch = "ON" if self.runtime_state.kill_switch else "OFF"
+        run_state = "\uc911\uc9c0" if self.runtime_state.paused else "\uc6b4\uc601"
         live_lock = "ON" if self.settings.demo_paper_hardlock else "OFF"
         pending = len(self.runtime_state.pending_approvals)
         reject_text_60m = self._format_reject_top(summary_60m.get("reject_top", []))
-        no_guard_text_60m = self._format_no_guard_top(window_minutes=60)
-
-        side_policy = (self.settings.signal_side_policy or "YES_PRIORITY").strip().upper()
-        approved_sides = list(self.runtime_state.recent_approved_signal_sides)
-        approved_yes = sum(1 for side in approved_sides if side == "YES")
-        approved_no = sum(1 for side in approved_sides if side == "NO")
-        approved_total = len(approved_sides)
-
-        base_min = float(self.settings.min_position_usd)
-        override_min = self.runtime_state.min_position_usd_override
-        effective_min = override_min if override_min is not None else base_min
-        tune_status = "미적용"
-        if self.runtime_state.auto_tune_zero_fill_applied and self.runtime_state.auto_tune_zero_fill_applied_at is not None:
-            tune_status = f"적용됨 ({self.runtime_state.auto_tune_zero_fill_applied_at.strftime('%m-%d %H:%M UTC')})"
-
-        hist_status = "통과" if hist_ok else "실패"
-        paper_status = "통과" if paper_ok else "실패"
-        hist_window = hist_metrics.window_days if hist_metrics is not None else 0
-        hist_pf = hist_metrics.pf if hist_metrics is not None else 0.0
-        hist_mdd = hist_metrics.mdd_pct if hist_metrics is not None else 1.0
-        hist_ece = hist_metrics.ece if hist_metrics is not None else 1.0
 
         return (
-            "[상태 요약]\n"
-            f"시각 {now}\n"
-            f"모드 {mode_label} | 상태 {run_state} | 킬스위치 {kill_switch} | 실거래차단 {live_lock}\n"
-            f"포지션 {len(open_positions)}개(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | 승인대기 {pending}건\n"
-            f"포지션 오픈/청산 {len(open_positions)} / {int(snapshot.get('closed_positions', 0))}\n"
-            f"실현손익(일/주) {snapshot['day_pnl']:+.2f} / {snapshot['week_pnl']:+.2f} USD\n"
-            f"미실현손익(현재) {unrealized_total:+.2f} USD\n"
-            f"드로다운(일/주) {risk_state.daily_drawdown_pct:.2%} / {risk_state.weekly_drawdown_pct:.2%}\n"
-            "[거래 카운트]\n"
-            f"진입체결(최근 60분) {summary_60m['filled_signals']}건 | "
-            f"실현거래(게이트 {self.settings.gate_paper_days}일) {paper_metrics.trades}건\n"
-            "[60분 실측]\n"
-            f"신호 {summary_60m['total_signals']}건 | 체결 {summary_60m['filled_signals']}건 ({summary_60m['fill_rate']:.1%})\n"
-            f"YES/NO {summary_60m['yes_signals']} / {summary_60m['no_signals']}\n"
-            f"거절 Top3 {reject_text_60m}\n"
-            f"NO 가드 Top3 {no_guard_text_60m}\n"
-            "[YES Priority]\n"
-            f"정책 {side_policy} | NO 상한 {self.settings.signal_no_max_ratio:.0%}\n"
-            f"최근 승인 YES/NO {approved_yes}/{approved_no} (표본 {approved_total})\n"
-            f"최근 60분 NO 체결 {summary_60m['filled_no_signals']}건 | NO 실현손익 {summary_60m['no_realized_pnl']:+.2f} USD\n"
-            "[사이징/튜닝]\n"
-            f"최소진입 base/override/effective {base_min:.2f} / "
-            f"{'-' if override_min is None else f'{override_min:.2f}'} / {effective_min:.2f} USD\n"
-            f"자동튜닝 상태 {tune_status}\n"
-            "[게이트]\n"
-            f"히스토리 {hist_status} (window {hist_window}d, PF {hist_pf:.2f}, MDD {hist_mdd:.2%}, ECE {hist_ece:.4f})\n"
-            f"페이퍼 {paper_status} (PF {paper_metrics.profit_factor:.2f}, "
-            f"MDD {paper_metrics.max_drawdown_pct:.2%}, 실현거래(청산완료) {paper_metrics.trades}건, "
-            f"위반 {paper_metrics.violations}건, 커버 {paper_metrics.covered_days:.1f}일)"
+            "[\uc0c1\ud0dc \uc694\uc57d]\n"
+            f"{now} | \ubaa8\ub4dc {mode_label} | \uc0c1\ud0dc {run_state} | \ud558\ub4dc\ub77d {live_lock}\n"
+            f"\uc624\ud508 \ud3ec\uc9c0\uc158 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus}) | \uc2b9\uc778\ub300\uae30 {pending}\n"
+            f"DD \uc77c/\uc8fc {risk_state.daily_drawdown_pct:.2%}/{risk_state.weekly_drawdown_pct:.2%}\n"
+            f"\uc77c/\uc8fc \uc190\uc775 {snapshot['day_pnl']:+.2f}/{snapshot['week_pnl']:+.2f} USD | \ubbf8\uc2e4\ud604 {unrealized_total:+.2f} USD\n"
+            f"\ucd5c\uadfc 60\ubd84 \uc2e0\ud638 {summary_60m['total_signals']} | \uccb4\uacb0 {summary_60m['filled_signals']}({summary_60m['fill_rate']:.0%}) | \uac70\uc808 {reject_text_60m}"
         )
 
-    async def build_report60_text(self) -> str:
-        tune_message = await self.maybe_apply_zero_fill_tuning()
-        summary_60m = await self.store.signal_window_summary(window_minutes=60)
+    async def build_report60_text(self, include_tune: bool = True) -> str:
+        tune_message = None
+        if include_tune:
+            tune_message = await self.maybe_apply_zero_fill_tuning()
+        summary = await self.store.signal_window_summary(window_minutes=60)
         snapshot = await self.store.status_snapshot()
-        paper_metrics = await self.gatekeeper.paper_metrics()
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
         _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
-        reject_text_60m = self._format_reject_top(summary_60m.get("reject_top", []))
-        no_guard_text_60m = self._format_no_guard_top(window_minutes=60)
+        reject_text = self._format_reject_top(summary.get("reject_top", []))
+        no_guard_text = self._format_no_guard_top(window_minutes=60)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         body = (
-            "[60분 실측 리포트]\n"
-            f"시각 {now}\n"
-            f"진입체결(60분) {summary_60m['filled_signals']}건 | "
-            f"실현거래(게이트 {self.settings.gate_paper_days}일) {paper_metrics.trades}건\n"
-            f"신호 {summary_60m['total_signals']}건 | 체결 {summary_60m['filled_signals']}건 ({summary_60m['fill_rate']:.1%})\n"
-            f"YES/NO {summary_60m['yes_signals']} / {summary_60m['no_signals']}\n"
-            f"거절 Top3 {reject_text_60m}\n"
-            f"NO 가드 Top3 {no_guard_text_60m}\n"
-            f"실현손익(60분) {summary_60m['realized_pnl']:+.2f} USD\n"
-            f"미실현손익(현재) {unrealized_total:+.2f} USD\n"
-            f"오픈 포지션 {snapshot['open_positions']}개(+{pos_plus}/0:{pos_flat}/-{pos_minus})\n"
-            f"누적 청산 포지션 {int(snapshot.get('closed_positions', 0))}개"
+            "[60\ubd84 \ub204\uc801]\n"
+            f"{now}\n"
+            f"\uc2e0\ud638 {summary['total_signals']} | \uccb4\uacb0 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
+            f"\uac70\uc808 {reject_text} | NO \uac00\ub4dc {no_guard_text}\n"
+            f"\uc2e4\ud604 {summary['realized_pnl']:+.2f} | \ubbf8\uc2e4\ud604 {unrealized_total:+.2f} | \uc624\ud508 \ud3ec\uc9c0\uc158 {snapshot['open_positions']}(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
         )
         if tune_message:
             return f"{body}\n\n{tune_message}"
         return body
 
     async def build_report6h_text(self) -> str:
-        summary_6h = await self.store.signal_window_summary(window_minutes=360)
+        summary = await self.store.signal_window_summary(window_minutes=360)
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
         _, unrealized_total, pos_plus, pos_flat, pos_minus = await self._position_pnl_stats(open_positions)
-        reject_text_6h = self._format_reject_top(summary_6h.get("reject_top", []))
-        no_guard_text_6h = self._format_no_guard_top(window_minutes=360)
+        reject_text = self._format_reject_top(summary.get("reject_top", []))
+        no_guard_text = self._format_no_guard_top(window_minutes=360)
+        six_hour_total_pnl = float(summary["realized_pnl"]) + float(unrealized_total)
+        six_hour_return_rate = six_hour_total_pnl / float(self.settings.starting_capital_usd)
+        side_policy = (self.settings.signal_side_policy or "BALANCED").strip().upper()
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         return (
-            "[6시간 리포트]\n"
-            f"시각 {now}\n"
-            f"신호 {summary_6h['total_signals']}건 | 체결 {summary_6h['filled_signals']}건 ({summary_6h['fill_rate']:.1%})\n"
-            f"YES/NO {summary_6h['yes_signals']} / {summary_6h['no_signals']}\n"
-            f"거절 Top3 {reject_text_6h}\n"
-            f"NO 가드 Top3 {no_guard_text_6h}\n"
-            f"실현손익(6시간) {summary_6h['realized_pnl']:+.2f} USD\n"
-            f"미실현손익(현재) {unrealized_total:+.2f} USD\n"
-            f"오픈 포지션 {len(open_positions)}개(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
+            "[6\uc2dc\uac04 \ub204\uc801]\n"
+            f"{now}\n"
+            f"\uc815\ucc45 {side_policy} | 6\uc2dc\uac04 \uc218\uc775\ub960 {six_hour_return_rate:+.2%}\n"
+            f"\uc2e0\ud638 {summary['total_signals']} | \uccb4\uacb0 {summary['filled_signals']}({summary['fill_rate']:.0%}) | YES/NO {summary['yes_signals']}/{summary['no_signals']}\n"
+            f"\uac70\uc808 {reject_text} | NO \uac00\ub4dc {no_guard_text}\n"
+            f"\uc2e4\ud604 {summary['realized_pnl']:+.2f} | \ubbf8\uc2e4\ud604 {unrealized_total:+.2f} | \uc624\ud508 \ud3ec\uc9c0\uc158 {len(open_positions)}(+{pos_plus}/0:{pos_flat}/-{pos_minus})"
+        )
+
+    async def maybe_apply_zero_fill_tuning(self) -> str | None:
+        now = datetime.now(timezone.utc)
+        self.runtime_state.auto_tune_zero_fill_last_checked_at = now
+        if not self.settings.auto_tune_zero_fill_enabled:
+            return self._build_tune_notice("disabled", now, "\uc790\ub3d9 \ud29c\ub2dd \ube44\ud65c\uc131\ud654")
+
+        summary = await self.store.signal_window_summary(window_minutes=self.settings.auto_tune_window_minutes)
+        total_signals = int(summary["total_signals"])
+        filled = int(summary["filled_signals"])
+        min_signals = max(1, int(self.settings.auto_tune_min_signals))
+        if total_signals < min_signals:
+            return self._build_tune_notice(
+                "insufficient_signals",
+                now,
+                f"\uc2e0\ud638 \ubd80\uc871 ({total_signals}/{min_signals})",
+            )
+        if filled > 0:
+            return self._build_tune_notice("has_fills", now, f"\uccb4\uacb0 \uc874\uc7ac ({filled}\uac74)")
+        if self.settings.auto_tune_apply_once and self.runtime_state.auto_tune_zero_fill_applied:
+            return self._build_tune_notice("already_applied", now, "\uc774\ubbf8 1\ud68c \uc801\uc6a9\ub428")
+
+        base_min = float(self.settings.min_position_usd)
+        target_min = max(0.1, float(self.settings.auto_tune_min_position_usd))
+        if target_min >= base_min:
+            return self._build_tune_notice(
+                "target_not_lower",
+                now,
+                f"\ubaa9\ud45c \ucd5c\uc18c\uae08\uc561\uc774 \uae30\uc874\ubcf4\ub2e4 \ub0ae\uc9c0 \uc54a\uc74c (base {base_min:.2f} / target {target_min:.2f})",
+            )
+
+        self.runtime_state.min_position_usd_override = target_min
+        self.runtime_state.auto_tune_zero_fill_applied = True
+        self.runtime_state.auto_tune_zero_fill_applied_at = now
+        return self._build_tune_notice(
+            "applied",
+            now,
+            f"\ubb34\uccb4\uacb0 0\uac74 \uac10\uc9c0: \ucd5c\uc18c\uae08\uc561 \ub0ae\ucda4 {base_min:.2f} -> {target_min:.2f} USD",
         )
 
     async def _position_pnl_stats(self, open_positions: list) -> tuple[list[str], float, int, int, int]:
@@ -259,17 +203,17 @@ class ReporterService:
         self.runtime_state.auto_tune_zero_fill_last_outcome = outcome
         checked_at = now.strftime("%H:%M:%S UTC")
         return (
-            "[자동 튜닝]\n"
-            f"윈도우 {self.settings.auto_tune_window_minutes}분\n"
-            f"결과 {outcome}\n"
-            f"사유 {detail}\n"
-            f"점검시각 {checked_at}"
+            "[\uc790\ub3d9 \ud29c\ub2dd]\n"
+            f"\uc708\ub3c4\uc6b0 {self.settings.auto_tune_window_minutes}\ubd84\n"
+            f"\uacb0\uacfc {outcome}\n"
+            f"\uc0c1\uc138 {detail}\n"
+            f"\ud655\uc778 {checked_at}"
         )
 
     def _format_reject_top(self, reject_top: object) -> str:
         if not isinstance(reject_top, list) or not reject_top:
-            return "없음"
-        return ", ".join(f"{str(status).replace('rejected:', '')} {count}건" for status, count in reject_top)
+            return "\uc5c6\uc74c"
+        return ", ".join(f"{str(status).replace('rejected:', '')} {count}\uac74" for status, count in reject_top)
 
     def _format_no_guard_top(self, window_minutes: int) -> str:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(window_minutes)))
@@ -286,4 +230,6 @@ class ReporterService:
             if isinstance(event, str):
                 reasons.append(event)
         top = Counter(reasons).most_common(3)
-        return ", ".join(f"{reason} {count}건" for reason, count in top) if top else "없음"
+        return ", ".join(f"{reason} {count}\uac74" for reason, count in top) if top else "\uc5c6\uc74c"
+
+

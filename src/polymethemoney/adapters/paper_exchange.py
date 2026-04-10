@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -84,6 +85,7 @@ class PaperExchange:
         if quote is None:
             return FillResult(
                 order_id=str(uuid4()),
+                strategy_id=intent.strategy_id,
                 market_id=market_id,
                 side=intent.side,
                 fill_price=intent.price,
@@ -94,9 +96,31 @@ class PaperExchange:
                 created_at=datetime.now(timezone.utc),
             )
 
+        if (self.settings.ab_test_enabled or self.settings.contrarian_enabled) and not self.settings.paper_post_only:
+            # Contrarian demo mode is intentionally "must enter": always take the
+            # current book price so the 1-minute cadence produces a real fill.
+            if intent.side.value == "YES":
+                fill_price = quote.ask
+            else:
+                fill_price = max(0.001, min(0.999, 1.0 - quote.bid))
+            fee_usd = intent.size_usd * (self.taker_fee_bps / 10000.0)
+            return FillResult(
+                order_id=str(uuid4()),
+                strategy_id=intent.strategy_id,
+                market_id=market_id,
+                side=intent.side,
+                fill_price=max(0.001, min(0.999, fill_price)),
+                size_usd=intent.size_usd,
+                status="filled",
+                fee_usd=fee_usd,
+                mode=TradingMode.PAPER,
+                created_at=datetime.now(timezone.utc),
+            )
+
         if quote.ask <= 0 or quote.bid <= 0:
             return FillResult(
                 order_id=str(uuid4()),
+                strategy_id=intent.strategy_id,
                 market_id=market_id,
                 side=intent.side,
                 fill_price=intent.price,
@@ -111,6 +135,7 @@ class PaperExchange:
         if spread > self.settings.max_spread:
             return FillResult(
                 order_id=str(uuid4()),
+                strategy_id=intent.strategy_id,
                 market_id=market_id,
                 side=intent.side,
                 fill_price=intent.price,
@@ -134,6 +159,7 @@ class PaperExchange:
                 if intent.price >= yes_ask:
                     return FillResult(
                         order_id=str(uuid4()),
+                        strategy_id=intent.strategy_id,
                         market_id=market_id,
                         side=intent.side,
                         fill_price=intent.price,
@@ -158,6 +184,7 @@ class PaperExchange:
                 if intent.price >= no_ask:
                     return FillResult(
                         order_id=str(uuid4()),
+                        strategy_id=intent.strategy_id,
                         market_id=market_id,
                         side=intent.side,
                         fill_price=intent.price,
@@ -182,6 +209,7 @@ class PaperExchange:
         if status != "filled":
             return FillResult(
                 order_id=str(uuid4()),
+                strategy_id=intent.strategy_id,
                 market_id=market_id,
                 side=intent.side,
                 fill_price=fill_price,
@@ -195,6 +223,7 @@ class PaperExchange:
         fee_usd = intent.size_usd * (self.taker_fee_bps / 10000.0)
         return FillResult(
             order_id=str(uuid4()),
+            strategy_id=intent.strategy_id,
             market_id=market_id,
             side=intent.side,
             fill_price=max(0.001, min(0.999, fill_price)),
@@ -217,7 +246,7 @@ class PaperExchange:
                 updated_at=tick_quote.updated_at,
             )
 
-        symbol = self._symbol_market_map.get(market_id)
+        symbol = self._symbol_market_map.get(market_id) or self._stable_symbol_for_market(market_id)
         if not symbol:
             return None, None
 
@@ -341,4 +370,8 @@ class PaperExchange:
         return parsed
 
     def _stable_symbol_for_market(self, market_id: str) -> str | None:
-        return None
+        if not self._tick_symbols:
+            return None
+        digest = hashlib.sha256(str(market_id).encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % len(self._tick_symbols)
+        return self._tick_symbols[idx]

@@ -50,6 +50,7 @@ class SignalORM(Base):
     __tablename__ = "signals"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     side: Mapped[str] = mapped_column(String(8))
@@ -66,6 +67,7 @@ class OrderORM(Base):
     __tablename__ = "orders"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
     signal_id: Mapped[str] = mapped_column(String(64), index=True)
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(8))
@@ -83,6 +85,7 @@ class FillORM(Base):
     __tablename__ = "fills"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
     order_id: Mapped[str] = mapped_column(String(64), index=True)
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(8))
@@ -98,6 +101,7 @@ class PositionORM(Base):
     __tablename__ = "positions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(8))
     entry_price: Mapped[float] = mapped_column(Float)
@@ -113,6 +117,7 @@ class EquityCurveORM(Base):
     __tablename__ = "equity_curve"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     equity_usd: Mapped[float] = mapped_column(Float)
     daily_drawdown_pct: Mapped[float] = mapped_column(Float)

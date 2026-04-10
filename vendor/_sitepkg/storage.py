@@ -6,7 +6,15 @@ from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from polymethemoney.domain import FeatureVector, MarketTick, OrderIntent, RiskState, Signal, TradingMode
+from polymethemoney.domain import (
+    STRATEGY_LEGACY,
+    FeatureVector,
+    MarketTick,
+    OrderIntent,
+    RiskState,
+    Signal,
+    TradingMode,
+)
 from polymethemoney.models import (
     BackfillRunORM,
     EquityCurveORM,
@@ -73,6 +81,7 @@ class Store:
         async with self.session_factory() as session:
             row = SignalORM(
                 id=signal.signal_id,
+                strategy_id=signal.strategy_id,
                 market_id=signal.market_id,
                 created_at=signal.created_at,
                 side=signal.side.value,
@@ -104,6 +113,7 @@ class Store:
         async with self.session_factory() as session:
             row = OrderORM(
                 id=order_id,
+                strategy_id=intent.strategy_id,
                 signal_id=intent.signal_id,
                 market_id=intent.market_id,
                 side=intent.side.value,
@@ -139,9 +149,11 @@ class Store:
         fee_usd: float,
         pnl_usd: float,
         trading_mode: TradingMode,
+        strategy_id: str = STRATEGY_LEGACY,
     ) -> None:
         async with self.session_factory() as session:
             fill = FillORM(
+                strategy_id=strategy_id,
                 order_id=order_id,
                 market_id=market_id,
                 side=side,
@@ -155,9 +167,18 @@ class Store:
             session.add(fill)
             await session.commit()
 
-    async def open_position(self, market_id: str, side: str, entry_price: float, size_usd: float, mode: TradingMode) -> None:
+    async def open_position(
+        self,
+        market_id: str,
+        side: str,
+        entry_price: float,
+        size_usd: float,
+        mode: TradingMode,
+        strategy_id: str = STRATEGY_LEGACY,
+    ) -> None:
         async with self.session_factory() as session:
             row = PositionORM(
+                strategy_id=strategy_id,
                 market_id=market_id,
                 side=side,
                 entry_price=entry_price,
@@ -169,11 +190,17 @@ class Store:
             session.add(row)
             await session.commit()
 
-    async def get_open_positions(self, trading_mode: TradingMode | None = None) -> list[PositionORM]:
+    async def get_open_positions(
+        self,
+        trading_mode: TradingMode | None = None,
+        strategy_id: str | None = None,
+    ) -> list[PositionORM]:
         async with self.session_factory() as session:
             stmt = select(PositionORM).where(PositionORM.status == "open")
             if trading_mode is not None:
                 stmt = stmt.where(PositionORM.trading_mode == trading_mode.value)
+            if strategy_id is not None:
+                stmt = stmt.where(PositionORM.strategy_id == strategy_id)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
@@ -183,6 +210,7 @@ class Store:
         opposite_side: str,
         exit_price: float,
         mode: TradingMode,
+        strategy_id: str | None = None,
     ) -> list[tuple[int, float]]:
         now = datetime.now(timezone.utc)
         closed: list[tuple[int, float]] = []
@@ -195,6 +223,8 @@ class Store:
                     PositionORM.trading_mode == mode.value,
                 )
             )
+            if strategy_id is not None:
+                stmt = stmt.where(PositionORM.strategy_id == strategy_id)
             rows = list((await session.execute(stmt)).scalars().all())
             for row in rows:
                 shares = row.size_usd / max(row.entry_price, 0.01)
@@ -207,25 +237,27 @@ class Store:
             await session.commit()
         return closed
 
-    async def close_all_open_positions(self, mode: TradingMode) -> int:
+    async def close_all_open_positions(self, mode: TradingMode, strategy_id: str | None = None) -> int:
         now = datetime.now(timezone.utc)
         async with self.session_factory() as session:
-            stmt = (
-                update(PositionORM)
-                .where(and_(PositionORM.status == "open", PositionORM.trading_mode == mode.value))
-                .values(status="closed", closed_at=now)
-            )
+            filters = [PositionORM.status == "open", PositionORM.trading_mode == mode.value]
+            if strategy_id is not None:
+                filters.append(PositionORM.strategy_id == strategy_id)
+            stmt = update(PositionORM).where(and_(*filters)).values(status="closed", closed_at=now)
             result = await session.execute(stmt)
             await session.commit()
             return int(result.rowcount or 0)
 
-    async def reset_paper_open_positions(self) -> dict[str, int]:
+    async def reset_paper_open_positions(self, strategy_ids: list[str] | None = None) -> dict[str, int]:
         now = datetime.now(timezone.utc)
         async with self.session_factory() as session:
-            pos_stmt = (
-                update(PositionORM)
-                .where(and_(PositionORM.status == "open", PositionORM.trading_mode == TradingMode.PAPER.value))
-                .values(status="closed", closed_at=now, realized_pnl_usd=0.0)
+            filters = [PositionORM.status == "open", PositionORM.trading_mode == TradingMode.PAPER.value]
+            if strategy_ids:
+                filters.append(PositionORM.strategy_id.in_(strategy_ids))
+            pos_stmt = update(PositionORM).where(and_(*filters)).values(
+                status="closed",
+                closed_at=now,
+                realized_pnl_usd=0.0,
             )
             pos_result = await session.execute(pos_stmt)
 
@@ -260,16 +292,18 @@ class Store:
         position_id: int,
         mark_price: float,
         mode: TradingMode,
+        strategy_id: str | None = None,
     ) -> dict | None:
         now = datetime.now(timezone.utc)
         async with self.session_factory() as session:
-            stmt = select(PositionORM).where(
-                and_(
-                    PositionORM.id == position_id,
-                    PositionORM.status == "open",
-                    PositionORM.trading_mode == mode.value,
-                )
-            )
+            filters = [
+                PositionORM.id == position_id,
+                PositionORM.status == "open",
+                PositionORM.trading_mode == mode.value,
+            ]
+            if strategy_id is not None:
+                filters.append(PositionORM.strategy_id == strategy_id)
+            stmt = select(PositionORM).where(and_(*filters))
             row = (await session.execute(stmt)).scalar_one_or_none()
             if row is None:
                 return None
@@ -282,6 +316,7 @@ class Store:
             await session.commit()
             return {
                 "position_id": int(row.id),
+                "strategy_id": str(row.strategy_id),
                 "market_id": str(row.market_id),
                 "side": str(row.side),
                 "size_usd": float(row.size_usd),
@@ -290,9 +325,15 @@ class Store:
                 "realized_pnl_usd": float(pnl),
             }
 
-    async def record_equity_curve(self, state: RiskState, equity_usd: float) -> None:
+    async def record_equity_curve(
+        self,
+        state: RiskState,
+        equity_usd: float,
+        strategy_id: str = STRATEGY_LEGACY,
+    ) -> None:
         async with self.session_factory() as session:
             row = EquityCurveORM(
+                strategy_id=strategy_id,
                 timestamp=datetime.now(timezone.utc),
                 equity_usd=equity_usd,
                 daily_drawdown_pct=state.daily_drawdown_pct,
@@ -614,6 +655,28 @@ class Store:
             rows = (await session.execute(sql, {"market_ids": market_ids})).all()
             return {str(row[0]): float(row[1]) for row in rows}
 
+    async def latest_market_expiries(self, market_ids: list[str]) -> dict[str, datetime | None]:
+        if not market_ids:
+            return {}
+        sql = text(
+            """
+            WITH latest AS (
+                SELECT market_id, MAX(timestamp) AS max_ts
+                FROM market_ticks
+                WHERE market_id = ANY(:market_ids)
+                GROUP BY market_id
+            )
+            SELECT t.market_id, t.expiry_ts
+            FROM market_ticks t
+            JOIN latest l
+              ON l.market_id = t.market_id
+             AND l.max_ts = t.timestamp
+            """
+        )
+        async with self.session_factory() as session:
+            rows = (await session.execute(sql, {"market_ids": market_ids})).all()
+            return {str(row[0]): row[1] for row in rows}
+
     async def market_questions(self, market_ids: list[str]) -> dict[str, str]:
         if not market_ids:
             return {}
@@ -858,71 +921,108 @@ class Store:
                 )
         return rows
 
-    async def realized_pnl_window(self, since: datetime) -> float:
+    async def realized_pnl_window(self, since: datetime, strategy_id: str | None = None) -> float:
         async with self.session_factory() as session:
-            stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(
-                and_(PositionORM.status == "closed", PositionORM.closed_at >= since)
-            )
+            filters = [PositionORM.status == "closed", PositionORM.closed_at >= since]
+            if strategy_id is not None:
+                filters.append(PositionORM.strategy_id == strategy_id)
+            stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(and_(*filters))
             value = await session.scalar(stmt)
+            if strategy_id is not None:
+                return float(value or 0.0)
             structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
                 and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= since)
             )
             structure_value = await session.scalar(structure_stmt)
             return float(value or 0.0) + float(structure_value or 0.0)
 
-    async def paper_trade_outcomes(self, since: datetime) -> list[float]:
+    async def paper_trade_outcomes(self, since: datetime, strategy_id: str | None = None) -> list[float]:
         async with self.session_factory() as session:
-            stmt = select(FillORM.pnl_usd).where(
-                and_(
-                    FillORM.trading_mode == TradingMode.PAPER.value,
-                    FillORM.created_at >= since,
-                    FillORM.pnl_usd != 0.0,
-                )
-            )
+            filters = [
+                FillORM.trading_mode == TradingMode.PAPER.value,
+                FillORM.created_at >= since,
+                FillORM.pnl_usd != 0.0,
+            ]
+            if strategy_id is not None:
+                filters.append(FillORM.strategy_id == strategy_id)
+            stmt = select(FillORM.pnl_usd).where(and_(*filters))
             rows = (await session.execute(stmt)).all()
             return [float(v[0]) for v in rows]
 
-    async def latest_equity(self) -> float:
+    async def latest_equity(self, strategy_id: str | None = None) -> float:
         async with self.session_factory() as session:
-            stmt = select(EquityCurveORM.equity_usd).order_by(EquityCurveORM.id.desc()).limit(1)
+            stmt = select(EquityCurveORM.equity_usd)
+            if strategy_id is not None:
+                stmt = stmt.where(EquityCurveORM.strategy_id == strategy_id)
+            stmt = stmt.order_by(EquityCurveORM.id.desc()).limit(1)
             last = await session.scalar(stmt)
             if last is None:
                 return self.starting_capital_usd
             return float(last)
 
-    async def status_snapshot(self) -> dict[str, float | int]:
+    async def status_snapshot(self, strategy_id: str | None = None) -> dict[str, float | int]:
         now = datetime.now(timezone.utc)
         day_ago = now - timedelta(days=1)
         week_ago = now - timedelta(days=7)
         async with self.session_factory() as session:
-            open_positions_stmt = select(func.count(PositionORM.id)).where(PositionORM.status == "open")
-            open_positions = int((await session.scalar(open_positions_stmt)) or 0)
-            structure_open_stmt = select(func.count(StructurePositionORM.id)).where(StructurePositionORM.status == "open")
-            open_positions += int((await session.scalar(structure_open_stmt)) or 0)
-            closed_positions_stmt = select(func.count(PositionORM.id)).where(PositionORM.status == "closed")
-            closed_positions = int((await session.scalar(closed_positions_stmt)) or 0)
-            structure_closed_stmt = select(func.count(StructurePositionORM.id)).where(StructurePositionORM.status == "closed")
-            closed_positions += int((await session.scalar(structure_closed_stmt)) or 0)
+            open_filters = [PositionORM.status == "open"]
+            closed_filters = [PositionORM.status == "closed"]
+            day_filters = [PositionORM.status == "closed", PositionORM.closed_at >= day_ago]
+            week_filters = [PositionORM.status == "closed", PositionORM.closed_at >= week_ago]
+            total_filters = [PositionORM.status == "closed"]
+            if strategy_id is not None:
+                open_filters.append(PositionORM.strategy_id == strategy_id)
+                closed_filters.append(PositionORM.strategy_id == strategy_id)
+                day_filters.append(PositionORM.strategy_id == strategy_id)
+                week_filters.append(PositionORM.strategy_id == strategy_id)
+                total_filters.append(PositionORM.strategy_id == strategy_id)
 
-            day_pnl_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(
-                and_(PositionORM.status == "closed", PositionORM.closed_at >= day_ago)
-            )
-            week_pnl_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(
-                and_(PositionORM.status == "closed", PositionORM.closed_at >= week_ago)
-            )
-            day_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
-                and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= day_ago)
-            )
-            week_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
-                and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= week_ago)
-            )
-            day_pnl = float((await session.scalar(day_pnl_stmt)) or 0.0) + float((await session.scalar(day_structure_stmt)) or 0.0)
-            week_pnl = float((await session.scalar(week_pnl_stmt)) or 0.0) + float((await session.scalar(week_structure_stmt)) or 0.0)
+            open_positions_stmt = select(func.count(PositionORM.id)).where(and_(*open_filters))
+            open_positions = int((await session.scalar(open_positions_stmt)) or 0)
+            if strategy_id is None:
+                structure_open_stmt = select(func.count(StructurePositionORM.id)).where(StructurePositionORM.status == "open")
+                open_positions += int((await session.scalar(structure_open_stmt)) or 0)
+
+            closed_positions_stmt = select(func.count(PositionORM.id)).where(and_(*closed_filters))
+            closed_positions = int((await session.scalar(closed_positions_stmt)) or 0)
+            if strategy_id is None:
+                structure_closed_stmt = select(func.count(StructurePositionORM.id)).where(StructurePositionORM.status == "closed")
+                closed_positions += int((await session.scalar(structure_closed_stmt)) or 0)
+
+            day_pnl_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(and_(*day_filters))
+            week_pnl_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(and_(*week_filters))
+            total_pnl_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(and_(*total_filters))
+            wins_stmt = select(func.count(PositionORM.id)).where(and_(*total_filters, PositionORM.realized_pnl_usd > 0))
+            losses_stmt = select(func.count(PositionORM.id)).where(and_(*total_filters, PositionORM.realized_pnl_usd < 0))
+
+            day_pnl = float((await session.scalar(day_pnl_stmt)) or 0.0)
+            week_pnl = float((await session.scalar(week_pnl_stmt)) or 0.0)
+            total_pnl = float((await session.scalar(total_pnl_stmt)) or 0.0)
+            wins = int((await session.scalar(wins_stmt)) or 0)
+            losses = int((await session.scalar(losses_stmt)) or 0)
+            if strategy_id is None:
+                day_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
+                    and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= day_ago)
+                )
+                week_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
+                    and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= week_ago)
+                )
+                total_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
+                    StructurePositionORM.status == "closed"
+                )
+                day_pnl += float((await session.scalar(day_structure_stmt)) or 0.0)
+                week_pnl += float((await session.scalar(week_structure_stmt)) or 0.0)
+                total_pnl += float((await session.scalar(total_structure_stmt)) or 0.0)
+        decisions = wins + losses
         return {
             "open_positions": open_positions,
             "closed_positions": closed_positions,
             "day_pnl": day_pnl,
             "week_pnl": week_pnl,
+            "total_pnl": total_pnl,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / decisions) if decisions > 0 else 0.0,
         }
 
     async def data_freshness_snapshot(self) -> dict[str, datetime | int | None]:
@@ -942,27 +1042,28 @@ class Store:
             "ticks_5m": int(ticks_5m or 0),
         }
 
-    async def signal_window_summary(self, window_minutes: int = 360) -> dict[str, float | int | list[tuple[str, int]]]:
+    async def signal_window_summary(
+        self,
+        window_minutes: int = 360,
+        strategy_id: str | None = None,
+    ) -> dict[str, float | int | list[tuple[str, int]]]:
         now = datetime.now(timezone.utc)
         minutes = max(1, int(window_minutes))
         since = now - timedelta(minutes=minutes)
         async with self.session_factory() as session:
-            total_stmt = select(func.count(SignalORM.id)).where(SignalORM.created_at >= since)
-            filled_stmt = select(func.count(SignalORM.id)).where(
-                and_(SignalORM.created_at >= since, SignalORM.status == "filled")
-            )
+            signal_base = [SignalORM.created_at >= since]
+            if strategy_id is not None:
+                signal_base.append(SignalORM.strategy_id == strategy_id)
+            total_stmt = select(func.count(SignalORM.id)).where(and_(*signal_base))
+            filled_stmt = select(func.count(SignalORM.id)).where(and_(*signal_base, SignalORM.status == "filled"))
             filled_yes_stmt = select(func.count(SignalORM.id)).where(
-                and_(SignalORM.created_at >= since, SignalORM.status == "filled", SignalORM.side == "YES")
+                and_(*signal_base, SignalORM.status == "filled", SignalORM.side == "YES")
             )
             filled_no_stmt = select(func.count(SignalORM.id)).where(
-                and_(SignalORM.created_at >= since, SignalORM.status == "filled", SignalORM.side == "NO")
+                and_(*signal_base, SignalORM.status == "filled", SignalORM.side == "NO")
             )
-            yes_stmt = select(func.count(SignalORM.id)).where(
-                and_(SignalORM.created_at >= since, SignalORM.side == "YES")
-            )
-            no_stmt = select(func.count(SignalORM.id)).where(
-                and_(SignalORM.created_at >= since, SignalORM.side == "NO")
-            )
+            yes_stmt = select(func.count(SignalORM.id)).where(and_(*signal_base, SignalORM.side == "YES"))
+            no_stmt = select(func.count(SignalORM.id)).where(and_(*signal_base, SignalORM.side == "NO"))
 
             total_signals = int((await session.scalar(total_stmt)) or 0)
             filled_signals = int((await session.scalar(filled_stmt)) or 0)
@@ -973,7 +1074,7 @@ class Store:
 
             reject_stmt = (
                 select(SignalORM.status, func.count(SignalORM.id))
-                .where(and_(SignalORM.created_at >= since, SignalORM.status.like("rejected:%")))
+                .where(and_(*signal_base, SignalORM.status.like("rejected:%")))
                 .group_by(SignalORM.status)
                 .order_by(func.count(SignalORM.id).desc())
                 .limit(3)
@@ -981,27 +1082,30 @@ class Store:
             reject_rows = (await session.execute(reject_stmt)).all()
             reject_top = [(str(status), int(count)) for status, count in reject_rows]
 
-            realized_main_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(
-                and_(PositionORM.status == "closed", PositionORM.closed_at >= since)
-            )
-            realized_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
-                and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= since)
-            )
-            no_realized_stmt = select(func.coalesce(func.sum(FillORM.pnl_usd), 0.0)).where(
-                and_(
-                    FillORM.created_at >= since,
-                    FillORM.trading_mode == TradingMode.PAPER.value,
-                    FillORM.side == "NO",
+            position_base = [PositionORM.status == "closed", PositionORM.closed_at >= since]
+            if strategy_id is not None:
+                position_base.append(PositionORM.strategy_id == strategy_id)
+            realized_main_stmt = select(func.coalesce(func.sum(PositionORM.realized_pnl_usd), 0.0)).where(and_(*position_base))
+            wins_stmt = select(func.count(PositionORM.id)).where(and_(*position_base, PositionORM.realized_pnl_usd > 0))
+            losses_stmt = select(func.count(PositionORM.id)).where(and_(*position_base, PositionORM.realized_pnl_usd < 0))
+            no_fill_base = [FillORM.created_at >= since, FillORM.trading_mode == TradingMode.PAPER.value, FillORM.side == "NO"]
+            if strategy_id is not None:
+                no_fill_base.append(FillORM.strategy_id == strategy_id)
+            no_realized_stmt = select(func.coalesce(func.sum(FillORM.pnl_usd), 0.0)).where(and_(*no_fill_base))
+            realized_pnl = float((await session.scalar(realized_main_stmt)) or 0.0)
+            wins = int((await session.scalar(wins_stmt)) or 0)
+            losses = int((await session.scalar(losses_stmt)) or 0)
+            if strategy_id is None:
+                realized_structure_stmt = select(func.coalesce(func.sum(StructurePositionORM.realized_pnl_usd), 0.0)).where(
+                    and_(StructurePositionORM.status == "closed", StructurePositionORM.closed_at >= since)
                 )
-            )
-            realized_pnl = float((await session.scalar(realized_main_stmt)) or 0.0) + float(
-                (await session.scalar(realized_structure_stmt)) or 0.0
-            )
+                realized_pnl += float((await session.scalar(realized_structure_stmt)) or 0.0)
             no_realized_pnl = float((await session.scalar(no_realized_stmt)) or 0.0)
 
         fill_rate = (filled_signals / total_signals) if total_signals > 0 else 0.0
         yes_ratio = (yes_signals / total_signals) if total_signals > 0 else 0.0
         no_ratio = (no_signals / total_signals) if total_signals > 0 else 0.0
+        decisions = wins + losses
         return {
             "window_minutes": minutes,
             "total_signals": total_signals,
@@ -1015,5 +1119,8 @@ class Store:
             "no_ratio": no_ratio,
             "realized_pnl": realized_pnl,
             "no_realized_pnl": no_realized_pnl,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / decisions) if decisions > 0 else 0.0,
             "reject_top": reject_top,
         }

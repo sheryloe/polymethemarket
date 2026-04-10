@@ -11,6 +11,12 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+STRATEGY_LEGACY = "legacy"
+STRATEGY_MODEL_A = "model_a_contrarian"
+STRATEGY_MODEL_B = "model_b_ensemble"
+AB_STRATEGY_IDS = (STRATEGY_MODEL_A, STRATEGY_MODEL_B)
+
+
 class Side(str, Enum):
     YES = "YES"
     NO = "NO"
@@ -60,6 +66,7 @@ class FeatureVector:
 
 @dataclass(slots=True)
 class Signal:
+    strategy_id: str
     market_id: str
     side: Side
     fair_prob: float
@@ -79,6 +86,7 @@ class Signal:
 
 @dataclass(slots=True)
 class OrderIntent:
+    strategy_id: str
     signal_id: str
     market_id: str
     side: Side
@@ -92,7 +100,6 @@ class OrderIntent:
 class RiskState:
     daily_drawdown_pct: float = 0.0
     weekly_drawdown_pct: float = 0.0
-    kill_switch: bool = False
     trading_mode: TradingMode = TradingMode.PAPER
     paused: bool = False
 
@@ -106,6 +113,7 @@ class Decision:
 
 @dataclass(slots=True)
 class FillResult:
+    strategy_id: str
     order_id: str
     market_id: str
     side: Side

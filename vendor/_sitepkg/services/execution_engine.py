@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from polymethemoney.adapters.paper_exchange import PaperExchange
@@ -53,9 +53,14 @@ class ExecutionEngine:
         await self.store.add_signal(signal)
         self.runtime_state.recent_signals.append(signal)
         open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
-        if self._open_same_market_side_count(open_positions, signal) >= max(1, self.settings.max_open_per_market_side):
-            await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open")
-            return
+        max_per_side = max(1, self.settings.max_open_per_market_side)
+        if self._open_same_market_side_count(open_positions, signal) >= max_per_side:
+            rotated = await self._rotate_market_side_if_needed(signal, open_positions, max_per_side)
+            if rotated:
+                open_positions = await self.store.get_open_positions(self.runtime_state.trading_mode)
+            if self._open_same_market_side_count(open_positions, signal) >= max_per_side:
+                await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open")
+                return
         structure_open = await self.store.structure_open_legs_count()
         decision = await self.risk_engine.decide(signal, len(open_positions) + structure_open)
         if decision.kind == DecisionType.REJECT:
@@ -73,11 +78,14 @@ class ExecutionEngine:
             self.runtime_state.pending_approvals[signal.signal_id] = intent
             await self.store.update_signal_status(signal.signal_id, "pending_approval")
             await self.notify_fn(
-                "[\uc2b9\uc778 \ub300\uae30 \uc2e0\ud638]\n"
-                f"\uc2dc\uadf8\ub110 ID {signal.signal_id}\n"
-                f"\uc2dc\uc7a5 {signal.market_id} | \ubc29\ud5a5 {signal.side.value}\n"
-                f"\uc810\uc218 {signal.score} | \uc5e3\uc9c0 {signal.edge:.4f}\n"
-                f"/approve {signal.signal_id} \ub610\ub294 /reject {signal.signal_id}"
+                "[승인 대기]\n"
+                "새로운 신호가 생성되어 승인을 기다리고 있습니다.\n"
+                f"신호 ID: {signal.signal_id}\n"
+                f"시장: {signal.market_id}\n"
+                f"방향: {signal.side.value}\n"
+                f"점수: {signal.score} | 엣지: {signal.edge:.4f}\n"
+                f"승인: /approve {signal.signal_id}\n"
+                f"거절: /reject {signal.signal_id}"
             )
             return
         await self._execute_intent(intent)
@@ -85,23 +93,40 @@ class ExecutionEngine:
     async def approve_signal(self, signal_id: str) -> str:
         intent = self.runtime_state.pending_approvals.pop(signal_id, None)
         if intent is None:
-            return f"[\uc2b9\uc778 \uc2e4\ud328]\n\ud574\ub2f9 \uc2dc\uadf8\ub110\uc744 \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4: {signal_id}"
+            return (
+                "[승인 실패]\n"
+                "요청한 신호를 찾지 못했습니다.\n"
+                f"신호 ID: {signal_id}"
+            )
         await self._execute_intent(intent)
-        return f"[\uc2b9\uc778 \uc644\ub8cc]\n\uc2dc\uadf8\ub110 {signal_id} \uc8fc\ubb38 \uc2e4\ud589\uc744 \uc2dc\ub3c4\ud588\uc2b5\ub2c8\ub2e4."
+        return (
+            "[승인 완료]\n"
+            "승인 요청을 처리하고 주문 실행을 시도했습니다.\n"
+            f"신호 ID: {signal_id}"
+        )
 
     async def reject_signal(self, signal_id: str) -> str:
         intent = self.runtime_state.pending_approvals.pop(signal_id, None)
         if intent is None:
-            return f"[\uac70\uc808 \uc2e4\ud328]\n\ud574\ub2f9 \uc2dc\uadf8\ub110\uc744 \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4: {signal_id}"
+            return (
+                "[거절 실패]\n"
+                "요청한 신호를 찾지 못했습니다.\n"
+                f"신호 ID: {signal_id}"
+            )
         await self.store.update_signal_status(signal_id, "rejected:manual")
-        return f"[\uac70\uc808 \uc644\ub8cc]\n\uc2dc\uadf8\ub110 {signal_id}\ub97c \uc218\ub3d9 \uac70\uc808\ud588\uc2b5\ub2c8\ub2e4."
+        return (
+            "[거절 완료]\n"
+            "신호를 수동으로 거절했습니다.\n"
+            f"신호 ID: {signal_id}"
+        )
 
     async def close_all_positions(self) -> int:
         mode = TradingMode.PAPER if self.settings.demo_paper_hardlock else self.runtime_state.trading_mode
         closed = await self.store.close_all_open_positions(mode)
         await self.notify_fn(
-            "[\uc804\uccb4 \uccad\uc0b0]\n"
-            f"\ubaa8\ub4dc {mode.value.upper()} \uc5d0\uc11c {closed}\uac1c \ud3ec\uc9c0\uc158 \uccad\uc0b0 \ucc98\ub9ac"
+            "[전체 청산 완료]\n"
+            f"{mode.value.upper()} 모드의 모든 포지션을 청산했습니다.\n"
+            f"청산 건수: {closed}건"
         )
         return closed
 
@@ -212,10 +237,11 @@ class ExecutionEngine:
             closed_count += 1
 
         await self.notify_fn(
-            "[수동 청산]\n"
-            f"사유 {reason}\n"
-            f"요청 {len(unique_ids)} | 청산 {closed_count} | 미존재 {missing} | 가격없음 {no_price}\n"
-            f"실현손익 {realized_total:+.2f} USD"
+            "[수동 청산 완료]\n"
+            "요청한 포지션에 대해 청산을 처리했습니다.\n"
+            f"요청 사유: {reason}\n"
+            f"요청 {len(unique_ids)}건 중 {closed_count}건 청산, 미존재 {missing}건, 가격 없음 {no_price}건입니다.\n"
+            f"실현 손익은 {realized_total:+.2f} USD 입니다."
         )
         return {
             "mode": mode.value,
@@ -229,7 +255,6 @@ class ExecutionEngine:
 
     async def emergency_stop(self, flatten: bool = True) -> dict:
         self.runtime_state.paused = True
-        self.runtime_state.kill_switch = True
         rejected = await self.reject_all_pending()
         flatten_result = {
             "requested": 0,
@@ -248,7 +273,7 @@ class ExecutionEngine:
             )
         return {
             "paused": self.runtime_state.paused,
-            "kill_switch": self.runtime_state.kill_switch,
+            "emergency_stop": True,
             "rejected_pending": rejected,
             "flatten": flatten_result,
         }
@@ -405,17 +430,27 @@ class ExecutionEngine:
             self.runtime_state.trading_mode = TradingMode.PAPER
             self.runtime_state.manual_live_approved = False
             await self.store.update_signal_status(intent.signal_id, "rejected:demo_paper_hardlock")
-            await self.notify_fn("[데모 모드] 실거래 경로가 차단되어 PAPER로 고정됩니다.")
+            await self.notify_fn(
+                "[데모 페이퍼 고정]\n"
+                "실거래 진입이 차단되어 PAPER 모드로 강제 전환되었습니다.\n"
+                "설정에서 DEMO_PAPER_HARDLOCK을 해제해야 라이브 진입이 가능합니다."
+            )
             return
         if mode == TradingMode.LIVE:
             gate_ok = await self.gatekeeper.is_live_gate_passed()
             if not gate_ok:
                 await self.store.update_signal_status(intent.signal_id, "rejected:live_gate_fail")
-                await self.notify_fn("[\ub9ac\uc2a4\ud06c]\n\uc2e4\uac70\ub798 \uac8c\uc774\ud2b8 \ubbf8\ud1b5\uacfc\ub85c PAPER \ubaa8\ub4dc \uc720\uc9c0")
+                await self.notify_fn(
+                    "[리스크 게이트 미통과]\n"
+                    "실거래 안전 게이트를 통과하지 못해 PAPER 모드를 유지합니다."
+                )
                 return
             if not self.runtime_state.manual_live_approved:
                 await self.store.update_signal_status(intent.signal_id, "rejected:manual_live_not_approved")
-                await self.notify_fn("[\ub9ac\uc2a4\ud06c]\n/go_live \uc218\ub3d9 \uc2b9\uc778 \ud6c4\uc5d0\ub9cc \uc2e4\uac70\ub798 \uc9c4\uc785 \uac00\ub2a5")
+                await self.notify_fn(
+                    "[라이브 승인 필요]\n"
+                    "실거래 진입을 위해 /go_live 승인 절차가 필요합니다."
+                )
                 return
         result = await self._execute_with_requote(intent, mode)
         if result is None:
@@ -424,14 +459,28 @@ class ExecutionEngine:
         if result.status != "filled":
             await self.store.update_signal_status(intent.signal_id, f"not_filled:{result.status}")
             await self.notify_fn(
-                "[\uc8fc\ubb38 \ubbf8\uccb4\uacb0]\n"
-                f"\uc2dc\uadf8\ub110 {intent.signal_id}\n"
-                f"\uc2dc\uc7a5 {intent.market_id}\n"
-                f"\uc0c1\ud0dc {result.status}"
+                "[주문 미체결]\n"
+                "주문이 체결되지 않았습니다.\n"
+                f"신호 ID: {intent.signal_id}\n"
+                f"시장: {intent.market_id}\n"
+                f"상태: {result.status}"
             )
             return
         await self.store.update_signal_status(intent.signal_id, "filled")
         await self._apply_fill_to_positions(intent, result)
+        question_map = await self.store.market_questions([intent.market_id])
+        question = (question_map.get(intent.market_id) or "").strip()
+        question_line = f"질문: {question}\n" if question else ""
+        await self.notify_fn(
+            "[체결 완료]\n"
+            f"모드: {result.mode.value.upper()}\n"
+            f"시장: {intent.market_id}\n"
+            f"방향: {intent.side.value}\n"
+            f"체결가: {result.fill_price:.4f}\n"
+            f"금액: {result.size_usd:.2f} USD\n"
+            f"주문 ID: {result.order_id}\n"
+            f"{question_line}"
+        )
         await self.risk_engine.refresh_state()
 
     async def _execute_with_requote(self, intent: OrderIntent, mode: TradingMode) -> FillResult | None:
@@ -521,3 +570,85 @@ class ExecutionEngine:
             for row in open_positions
             if str(getattr(row, "market_id", "")) == market_id and str(getattr(row, "side", "")).upper() == side
         )
+
+    async def _rotate_market_side_if_needed(
+        self,
+        signal: Signal,
+        open_positions: list,
+        max_per_side: int,
+    ) -> bool:
+        if not self.settings.market_side_rotation_enabled:
+            return False
+        mode = self.runtime_state.trading_mode
+        if mode != TradingMode.PAPER:
+            return False
+        market_id = str(signal.market_id)
+        side = signal.side.value.upper()
+        candidates = [
+            row
+            for row in open_positions
+            if str(getattr(row, "market_id", "")) == market_id and str(getattr(row, "side", "")).upper() == side
+        ]
+        if len(candidates) < max_per_side:
+            return False
+
+        now = datetime.now(timezone.utc)
+        min_age = timedelta(minutes=max(0, int(self.settings.market_side_rotation_min_age_minutes)))
+        eligible = [
+            row
+            for row in candidates
+            if getattr(row, "opened_at", None) is None or (now - row.opened_at) >= min_age
+        ]
+        if not eligible:
+            await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open_recent")
+            return False
+
+        eligible.sort(key=lambda row: getattr(row, "opened_at", now) or now)
+        required_close = (len(candidates) - max_per_side) + 1
+        required_close = max(1, required_close)
+        to_close = eligible[:required_close]
+
+        latest_prices = await self.store.latest_market_prices([market_id])
+        yes_price = latest_prices.get(market_id)
+        if yes_price is None:
+            return False
+
+        closed_count = 0
+        realized_total = 0.0
+        for row in to_close:
+            mark_price = (1.0 - float(yes_price)) if side == "NO" else float(yes_price)
+            mark_price = max(0.001, min(0.999, mark_price))
+            closed = await self.store.close_position_at_mark(
+                position_id=int(row.id),
+                mark_price=mark_price,
+                mode=mode,
+            )
+            if closed is None:
+                continue
+            realized = float(closed["realized_pnl_usd"])
+            order_id = f"rotate-{int(row.id)}-{int(now.timestamp())}"
+            await self.store.add_fill(
+                order_id=order_id,
+                market_id=market_id,
+                side=side,
+                fill_price=float(closed["exit_price"]),
+                size_usd=float(closed["size_usd"]),
+                fee_usd=0.0,
+                pnl_usd=realized,
+                trading_mode=mode,
+            )
+            if realized != 0.0:
+                await self.gatekeeper.register_paper_trade(realized, when=now)
+            realized_total += realized
+            closed_count += 1
+
+        if closed_count > 0:
+            await self.risk_engine.refresh_state()
+            await self.notify_fn(
+                "[시장 회전 청산]\n"
+                "동일 시장/방향 보유 한도 초과로 오래된 포지션을 청산했습니다.\n"
+                f"시장: {market_id} | 방향: {side}\n"
+                f"청산 {closed_count}건, 실현 손익 {realized_total:+.2f} USD 입니다."
+            )
+            return True
+        return False

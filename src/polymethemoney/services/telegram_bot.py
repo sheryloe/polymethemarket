@@ -2,28 +2,49 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Any
+import os
+from dataclasses import dataclass
+from datetime import timezone
+from typing import Awaitable, Callable
 
 import httpx
 
 from polymethemoney.config import Settings
-from polymethemoney.domain import TradingMode
-from polymethemoney.services.llm_client import LLMClient
+from polymethemoney.domain import STRATEGY_MODEL_A, STRATEGY_MODEL_B, TradingMode
+from polymethemoney.services.execution_engine import ExecutionEngine
+from polymethemoney.services.gatekeeper import Gatekeeper
+from polymethemoney.services.reporter import ReporterService
+from polymethemoney.services.risk_engine import RiskEngine
+from polymethemoney.state import RuntimeState
+from polymethemoney.storage import Store
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class PositionView:
+    index: int
+    position_id: int
+    market_id: str
+    side: str
+    size_usd: float
+    entry_price: float
+    mark_price: float
+    unrealized_pnl_usd: float
+    question: str
+    strategy_id: str | None = None
 
 
 class TelegramBotService:
     def __init__(
         self,
         settings: Settings,
-        runtime_state,
-        store,
-        execution_engine,
-        risk_engine,
-        gatekeeper,
-        reporter,
+        runtime_state: RuntimeState,
+        store: Store,
+        execution_engine: ExecutionEngine,
+        risk_engine: RiskEngine,
+        gatekeeper: Gatekeeper,
+        reporter: ReporterService,
     ) -> None:
         self.settings = settings
         self.runtime_state = runtime_state
@@ -32,496 +53,496 @@ class TelegramBotService:
         self.risk_engine = risk_engine
         self.gatekeeper = gatekeeper
         self.reporter = reporter
-        self.llm = LLMClient(settings)
-        self._token = (settings.telegram_bot_token or "").strip()
-        self._chat_id = (settings.telegram_chat_id or "").strip()
-        self._api_base = f"https://api.telegram.org/bot{self._token}"
-        self._offset = 0
 
-    async def run(self) -> None:
-        if not self._token or not self._chat_id:
-            logger.warning("telegram disabled: missing token/chat id")
-            return
-
-        async with httpx.AsyncClient(timeout=35) as client:
-            while True:
-                try:
-                    updates = await self._get_updates(client)
-                    for update in updates:
-                        await self._handle_update(client, update)
-                except Exception:
-                    logger.exception("telegram polling failed")
-                    await asyncio.sleep(3)
-
-    async def notify(self, text: str) -> None:
-        if not self._token or not self._chat_id:
-            return
-        async with httpx.AsyncClient(timeout=15) as client:
-            await self._send_message(client, text)
-
-    async def _get_updates(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
-        payload = {
-            "offset": self._offset,
-            "timeout": 25,
-            "allowed_updates": ["message"],
-        }
-        resp = await client.post(f"{self._api_base}/getUpdates", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            return []
-        return data.get("result", [])
-
-    async def _handle_update(self, client: httpx.AsyncClient, update: dict[str, Any]) -> None:
-        update_id = update.get("update_id")
-        if isinstance(update_id, int):
-            self._offset = max(self._offset, update_id + 1)
-
-        message = update.get("message") or {}
-        text = (message.get("text") or "").strip()
-        chat = message.get("chat") or {}
-        chat_id = str(chat.get("id") or "")
-        if not text or chat_id != self._chat_id:
-            return
-
-        cmd, *rest = text.split(maxsplit=1)
-        arg = rest[0] if rest else ""
-        cmd = cmd.lower()
-
-        if cmd in ("/help", "/start"):
-            await self._send_message(client, self._help_text())
-            return
-        if cmd == "/status":
-            await self._send_message(client, await self.reporter.build_status_text())
-            return
-        if cmd in ("/report60", "/report"):
-            await self._send_message(client, await self.reporter.build_report60_text())
-            return
-        if cmd == "/report6h":
-            await self._send_message(client, await self.reporter.build_report6h_text())
-            return
-        if cmd == "/positions":
-            await self._send_message(client, await self._build_positions_card(arg))
-            return
-        if cmd == "/pending":
-            await self._send_message(client, await self._build_pending_card())
-            return
-        if cmd == "/pnl":
-            await self._send_message(client, await self._build_pnl_card())
-            return
-        if cmd == "/risk":
-            await self._send_message(client, await self._build_risk_card())
-            return
-        if cmd == "/gate":
-            await self._send_message(client, await self._build_gate_card())
-            return
-        if cmd == "/data":
-            await self._send_message(client, await self._build_data_card())
-            return
-        if cmd == "/pause":
-            await self._send_message(client, await self._cmd_pause())
-            return
-        if cmd == "/resume":
-            await self._send_message(client, await self._cmd_resume())
-            return
-        if cmd == "/kill_on":
-            await self._send_message(client, await self._cmd_kill_on())
-            return
-        if cmd == "/kill_off":
-            await self._send_message(client, await self._cmd_kill_off())
-            return
-        if cmd == "/go_live":
-            await self._send_message(client, await self._cmd_go_live())
-            return
-        if cmd == "/go_paper":
-            await self._send_message(client, await self._cmd_go_paper())
-            return
-        if cmd == "/set_minpos":
-            await self._send_message(client, await self._cmd_set_minpos(arg))
-            return
-        if cmd == "/clear_minpos":
-            await self._send_message(client, await self._cmd_clear_minpos())
-            return
-        if cmd == "/tuning":
-            await self._send_message(client, await self._cmd_tuning(arg))
-            return
-        if cmd == "/tuning_reset":
-            await self._send_message(client, await self._cmd_tuning_reset())
-            return
-        if cmd == "/approve":
-            await self._send_message(client, await self._cmd_approve(arg))
-            return
-        if cmd == "/reject":
-            await self._send_message(client, await self._cmd_reject(arg))
-            return
-        if cmd == "/reject_all":
-            await self._send_message(client, await self._cmd_reject_all())
-            return
-        if cmd == "/close":
-            await self._send_message(client, await self._cmd_close(arg))
-            return
-        if cmd == "/close_market":
-            await self._send_message(client, await self._cmd_close_market(arg))
-            return
-        if cmd == "/close_side":
-            await self._send_message(client, await self._cmd_close_side(arg))
-            return
-        if cmd == "/closeall":
-            await self._send_message(client, await self._cmd_closeall())
-            return
-        if cmd == "/panic":
-            await self._send_message(client, await self._cmd_panic())
-            return
-
-        await self._send_message(client, "지원하지 않는 명령입니다. /help")
-
-    async def _send_message(self, client: httpx.AsyncClient, text: str) -> None:
-        payload = {
-            "chat_id": self._chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        }
-        await client.post(f"{self._api_base}/sendMessage", json=payload)
-
-    def _help_text(self) -> str:
-        return (
-            "[명령어]\n"
-            "모니터링\n"
-            "/status - 상태 요약\n"
-            "/report60 - 최근 60분 요약\n"
-            "/report6h - 최근 6시간 요약\n"
-            "/positions [N] - 포지션 상세(기본 10, 최대 40)\n"
-            "/pending - 승인 대기 신호\n"
-            "/pnl - 손익 요약\n"
-            "/risk - 리스크 상태\n"
-            "/gate - 게이트 요약\n"
-            "/data - 데이터 신선도\n"
-            "제어\n"
-            "/pause - 신규 진입 일시정지\n"
-            "/resume - 일시정지 해제\n"
-            "/kill_on - 킬스위치 ON\n"
-            "/kill_off - 킬스위치 OFF\n"
-            "/go_paper - PAPER 모드 전환\n"
-            "/go_live - 게이트 통과 시 LIVE 전환(하드락이면 차단)\n"
-            "/set_minpos <usd> - 최소 진입 금액 override\n"
-            "/clear_minpos - 최소 진입 override 해제\n"
-            "/tuning <goal> - LLM 튜닝 제안 런타임 적용\n"
-            "/tuning_reset - LLM 튜닝 오버라이드 해제\n"
-            "승인/거절\n"
-            "/approve <signal_id> - 승인\n"
-            "/reject <signal_id> - 거절\n"
-            "/reject_all - 승인대기 일괄 거절\n"
-            "강제 청산\n"
-            "/close <position_id>\n"
-            "/close_market <market_id>\n"
-            "/close_side <YES|NO> [limit]\n"
-            "/closeall - 전체 강제 청산\n"
-            "/panic - 일시정지+킬스위치+전체청산"
+        self._token = (self.settings.telegram_bot_token or "").strip()
+        self._chat_id = int(self.settings.telegram_chat_id) if self.settings.telegram_chat_id else None
+        self._base_url = f"https://api.telegram.org/bot{self._token}" if self._token else ""
+        self._last_update_id = 0
+        self._client: httpx.AsyncClient | None = None
+        self._poll_timeout = 20
+        self.enabled = bool(self._token and self._chat_id)
+        self.instant_alerts_enabled = (
+            os.getenv("TELEGRAM_INSTANT_ALERTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
         )
 
-    async def _build_positions_card(self, arg: str) -> str:
-        limit = self._parse_positive_int(arg, default=10, max_value=40)
-        rows = await self.store.get_open_positions(self.runtime_state.trading_mode)
-        if not rows:
-            return "[포지션]\n없음"
+        self._handlers: dict[str, Callable[[int, str], Awaitable[None]]] = {
+            "help": self._cmd_help,
+            "start": self._cmd_help,
+            "status": self._cmd_status,
+            "report30": self._cmd_report30,
+            "report60": self._cmd_report60,
+            "report6h": self._cmd_report6h,
+            "positions": self._cmd_positions,
+            "pending": self._cmd_pending,
+            "pnl": self._cmd_pnl,
+            "risk": self._cmd_risk,
+            "gate": self._cmd_gate,
+            "data": self._cmd_data,
+            "config": self._cmd_config,
+            "pause": self._cmd_pause,
+            "resume": self._cmd_resume,
+            "go_live": self._cmd_go_live,
+            "go_paper": self._cmd_go_paper,
+            "set_minpos": self._cmd_set_minpos,
+            "clear_minpos": self._cmd_clear_minpos,
+            "reset_paper": self._cmd_reset_paper,
+            "approve": self._cmd_approve,
+            "reject": self._cmd_reject,
+            "reject_all": self._cmd_reject_all,
+            "close": self._cmd_close,
+            "close_market": self._cmd_close_market,
+            "close_side": self._cmd_close_side,
+            "closeall": self._cmd_closeall,
+            "panic": self._cmd_panic,
+        }
+
+    async def run(self) -> None:
+        if not self.enabled:
+            logger.warning("Telegram disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+            while True:
+                await asyncio.sleep(3600)
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        while True:
+            try:
+                await self._poll_once()
+            except Exception:
+                logger.exception("telegram poll failed")
+                await asyncio.sleep(2)
+
+    async def notify(self, text: str) -> None:
+        if not self.enabled or self._chat_id is None:
+            logger.info("notify skipped: %s", text)
+            return
+        if not self.instant_alerts_enabled and not self._is_periodic_report(text):
+            return
+        await self._send_text(self._chat_id, text)
+
+    async def _poll_once(self) -> None:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        params = {"timeout": self._poll_timeout, "allowed_updates": "message"}
+        if self._last_update_id:
+            params["offset"] = self._last_update_id + 1
+        resp = await self._client.get(f"{self._base_url}/getUpdates", params=params)
+        payload = resp.json()
+        if not payload.get("ok"):
+            return
+        for update in payload.get("result", []):
+            update_id = int(update.get("update_id", 0))
+            if update_id > self._last_update_id:
+                self._last_update_id = update_id
+            message = update.get("message")
+            if not isinstance(message, dict):
+                continue
+            await self._handle_message(message)
+
+    async def _handle_message(self, message: dict) -> None:
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if self._chat_id is None or chat_id != self._chat_id:
+            return
+        text = (message.get("text") or "").strip()
+        if not text or not text.startswith("/"):
+            return
+        command, args = self._parse_command(text)
+        handler = self._handlers.get(command)
+        if handler is None:
+            await self._send_text(chat_id, "[알림]\n알 수 없는 명령입니다. /help 를 확인해 주세요.")
+            return
+        await handler(chat_id, args)
+
+    async def _send_text(self, chat_id: int, text: str) -> None:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        try:
+            await self._client.post(
+                f"{self._base_url}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+            )
+        except Exception:
+            logger.exception("telegram send failed")
+
+    @staticmethod
+    def _parse_command(text: str) -> tuple[str, str]:
+        parts = text.split()
+        cmd = parts[0].split("@", 1)[0].lstrip("/")
+        args = " ".join(parts[1:]) if len(parts) > 1 else ""
+        return cmd, args
+
+    @staticmethod
+    def _is_periodic_report(text: str) -> bool:
+        if not text:
+            return False
+        prefixes = (
+            "[30분 A/B 비교]",
+            "[60분 A/B 비교]",
+            "[6시간 A/B 비교]",
+            "[10분 누적]",
+            "[60분 누적]",
+            "[6시간 누적]",
+            "[상태 요약]",
+        )
+        return text.startswith(prefixes)
+
+    async def _cmd_help(self, chat_id: int, args: str) -> None:
+        if self.settings.ab_test_enabled:
+            text = (
+                "[봇 도움말]\n"
+                "A/B 듀얼 페이퍼 비교 모드입니다.\n\n"
+                "핵심 조회\n"
+                "/status : A/B 현재 상태 요약\n"
+                "/report30 : 최근 30분 A/B 비교\n"
+                "/report60 : 최근 60분 A/B 비교\n"
+                "/report6h : 최근 6시간 A/B 비교\n"
+                "/positions a [개수] : 모델 A 오픈 포지션 조회\n"
+                "/positions b [개수] : 모델 B 오픈 포지션 조회\n"
+                "/pnl : A/B 손익 요약\n"
+                "/config : 현재 운용 설정\n\n"
+                "운영 제어\n"
+                "/pause : 신규 진입 일시 중지\n"
+                "/resume : 신규 진입 재개\n"
+                "/reset_paper : 모델 A/B 포지션과 런타임 상태 초기화\n"
+                "/close <position_id> : 특정 포지션 강제 청산\n"
+                "/close_market <market_id> : 특정 시장 전체 청산\n"
+                "/close_side <YES|NO> [limit] : 방향 기준 강제 청산\n"
+                "/closeall : 오픈 포지션 전체 청산\n"
+                "/panic : 긴급 중지 및 전량 청산\n\n"
+                "예시\n"
+                "/positions a 10\n"
+                "/positions b\n"
+                "/report30"
+            )
+        else:
+            text = (
+                "[봇 도움말]\n"
+                "BTC 5분 Up/Down 페이퍼 운용을 텔레그램에서 제어합니다.\n\n"
+                "모니터링\n"
+                "/status : 현재 상태 요약\n"
+                "/report60 : 최근 60분 누적\n"
+                "/report6h : 최근 6시간 누적\n"
+                "/positions [개수] : 오픈 포지션 상세\n"
+                "/pending : 승인 대기 신호 목록\n"
+                "/pnl : 손익 요약\n"
+                "/risk : 리스크 상태\n"
+                "/gate : 게이트 현황\n"
+                "/data : 데이터 신선도\n"
+                "/config : 운영 설정 요약\n\n"
+                "운영 제어\n"
+                "/pause /resume /go_paper /go_live\n"
+                "/set_minpos <usd> /clear_minpos\n"
+                "/reset_paper\n\n"
+                "청산\n"
+                "/close <position_id>\n"
+                "/close_market <market_id>\n"
+                "/close_side <YES|NO> [limit]\n"
+                "/closeall\n"
+                "/panic"
+            )
+        await self._send_text(chat_id, text)
+
+    async def _cmd_status(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_status_text())
+
+    async def _cmd_report30(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_report30_text())
+
+    async def _cmd_report60(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_report60_text())
+
+    async def _cmd_report6h(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_report6h_text())
+
+    async def _cmd_positions(self, chat_id: int, args: str) -> None:
+        strategy_id, limit = self._parse_positions_args(args)
+        if self.settings.ab_test_enabled and strategy_id is None:
+            await self._send_text(chat_id, "[사용법]\n/positions a [개수]\n/positions b [개수]\n예: /positions a 10")
+            return
         if limit is None:
-            return "[사용법]\n/positions [개수]\n예) /positions 20"
-        limit = max(1, min(limit, 40))
+            await self._send_text(chat_id, "[사용법]\n/positions a [개수]\n예: /positions b 20")
+            return
 
-        views, unrealized_total = await self._build_position_views(rows, limit=limit)
-        pos_plus = sum(1 for view in views if view["unrealized_pnl_usd"] > 1e-6)
-        pos_minus = sum(1 for view in views if view["unrealized_pnl_usd"] < -1e-6)
+        views, unrealized_total = await self._build_position_views(limit=limit, strategy_id=strategy_id)
+        label = self._strategy_label(strategy_id)
+        if not views:
+            await self._send_text(chat_id, f"[포지션]\n{label} 현재 오픈된 포지션이 없습니다.")
+            return
+
+        pos_plus = sum(1 for v in views if v.unrealized_pnl_usd > 1e-6)
+        pos_minus = sum(1 for v in views if v.unrealized_pnl_usd < -1e-6)
         pos_flat = len(views) - pos_plus - pos_minus
-
         lines = [
-            f"[포지션] 총 {len(rows)}개 (상위 {limit})",
+            f"[포지션 요약] {label} 총 {len(views)}개",
             f"미실현 합계 {unrealized_total:+.2f} USD | +{pos_plus}/0:{pos_flat}/-{pos_minus}",
         ]
         for view in views:
-            short_q = view["question"] if len(view["question"]) <= 44 else f"{view['question'][:41]}..."
+            short_q = view.question if len(view.question) <= 44 else f"{view.question[:41]}..."
             lines.append(
-                f"{view['index']}. id={view['position_id']} {view['side']} {view['size_usd']:.2f} USD "
-                f"({view['entry_price']:.4f} -> {view['mark_price']:.4f}, {view['unrealized_pnl_usd']:+.2f})\n"
-                f"   {view['market_id']} | {short_q}"
+                f"{view.index}. id={view.position_id} {view.side} {view.size_usd:.2f} USD "
+                f"({view.entry_price:.4f} -> {view.mark_price:.4f}, {view.unrealized_pnl_usd:+.2f})\n"
+                f"   {view.market_id} | {short_q}"
             )
-        return "\n".join(lines)
+        await self._send_text(chat_id, "\n".join(lines))
 
-    async def _build_pending_card(self) -> str:
+    async def _cmd_pending(self, chat_id: int, args: str) -> None:
         items = list(self.runtime_state.pending_approvals.items())
         if not items:
-            return "[승인 대기]\n없음"
+            await self._send_text(chat_id, "[승인 대기]\n현재 대기 중인 신호가 없습니다.")
+            return
         lines = [f"[승인 대기] 총 {len(items)}건"]
         for idx, (signal_id, intent) in enumerate(items[:20], start=1):
+            label = self._strategy_label(getattr(intent, "strategy_id", None))
             lines.append(
                 f"{idx}. {signal_id}\n"
-                f"   시장 {intent.market_id} | 방향 {intent.side.value} | 가격 {intent.price:.4f} | 금액 {intent.size_usd:.2f} USD"
+                f"   전략 {label} | 시장 {intent.market_id} | 방향 {intent.side.value} | 가격 {intent.price:.4f} | 금액 {intent.size_usd:.2f} USD"
             )
         if len(items) > 20:
             lines.append(f"... 외 {len(items) - 20}건")
-        return "\n".join(lines)
+        await self._send_text(chat_id, "\n".join(lines))
 
-    async def _build_pnl_card(self) -> str:
+    async def _cmd_pnl(self, chat_id: int, args: str) -> None:
+        if self.settings.ab_test_enabled:
+            await self._send_text(chat_id, await self._build_ab_pnl_text())
+            return
+
         snapshot = await self.store.status_snapshot()
-        _, unrealized_total = await self._build_position_views(
-            await self.store.get_open_positions(self.runtime_state.trading_mode),
-            limit=10_000,
-        )
+        _, unrealized_total = await self._build_position_views(limit=10_000)
         est_total = float(snapshot["week_pnl"]) + unrealized_total
-        return (
+        await self._send_text(
+            chat_id,
             "[손익 요약]\n"
-            f"일간 실현 {snapshot['day_pnl']:+.2f} USD\n"
-            f"주간 실현 {snapshot['week_pnl']:+.2f} USD\n"
-            f"미실현 {unrealized_total:+.2f} USD\n"
-            f"주간+미실현 {est_total:+.2f} USD\n"
-            f"오픈 포지션 {snapshot['open_positions']}개"
+            f"일간 실현 손익 {snapshot['day_pnl']:+.2f} USD\n"
+            f"주간 실현 손익 {snapshot['week_pnl']:+.2f} USD\n"
+            f"현재 미실현 손익 {unrealized_total:+.2f} USD\n"
+            f"주간 실현+미실현 {est_total:+.2f} USD\n"
+            f"오픈 포지션 {snapshot['open_positions']}개",
         )
 
-    async def _build_risk_card(self) -> str:
+    async def _cmd_risk(self, chat_id: int, args: str) -> None:
         state = await self.risk_engine.refresh_state()
         pause_text = "ON" if self.runtime_state.paused else "OFF"
-        kill_text = "ON" if self.runtime_state.kill_switch else "OFF"
-        return (
+        await self._send_text(
+            chat_id,
             "[리스크 상태]\n"
-            f"일시정지 {pause_text} | 킬스위치 {kill_text}\n"
+            f"일시중지 {pause_text}\n"
             f"일간 DD {state.daily_drawdown_pct:.2%}\n"
             f"주간 DD {state.weekly_drawdown_pct:.2%}\n"
-            f"손실한도(일/주) {self.settings.daily_loss_limit_pct:.2%} / {self.settings.weekly_loss_limit_pct:.2%}"
+            f"한도(일/주) {self.settings.daily_loss_limit_pct:.2%} / {self.settings.weekly_loss_limit_pct:.2%}",
         )
 
-    async def _build_gate_card(self) -> str:
-        return f"[게이트]\n{await self.gatekeeper.summary_text()}"
+    async def _cmd_gate(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, f"[게이트]\n{await self.gatekeeper.summary_text()}")
 
-    async def _build_data_card(self) -> str:
+    async def _cmd_data(self, chat_id: int, args: str) -> None:
         snapshot = await self.store.data_freshness_snapshot()
         latest_tick = self._fmt_ts(snapshot.get("latest_tick_ts"))
         latest_feature = self._fmt_ts(snapshot.get("latest_feature_ts"))
         latest_signal = self._fmt_ts(snapshot.get("latest_signal_ts"))
         ticks_5m = int(snapshot.get("ticks_5m") or 0)
-        return (
+        await self._send_text(
+            chat_id,
             "[데이터 신선도]\n"
             f"최근 tick {latest_tick}\n"
             f"최근 feature {latest_feature}\n"
             f"최근 signal {latest_signal}\n"
-            f"최근 5분 tick 수 {ticks_5m}건"
+            f"최근 5분 tick 수 {ticks_5m}건",
         )
 
-    async def _cmd_pause(self) -> str:
+    async def _cmd_config(self, chat_id: int, args: str) -> None:
+        mode = self.runtime_state.trading_mode.value.upper()
+        if self.settings.ab_test_enabled:
+            text = (
+                "[운영 설정]\n"
+                f"모드 {mode} | DEMO_PAPER_HARDLOCK {self.settings.demo_paper_hardlock}\n"
+                f"A/B 테스트 {self.settings.ab_test_enabled}\n"
+                f"시장 프리픽스 {self.settings.contrarian_market_slug_prefix}\n"
+                f"전략별 시드 {self.settings.model_portfolio_starting_capital_usd:.2f} USD\n"
+                f"전략별 진입 {self.settings.model_position_usd:.2f} USD | 전략별 최대 포지션 {self.settings.model_max_positions}\n"
+                f"진입 간격 {self.settings.contrarian_entry_interval_seconds}s | 만기 그레이스 {self.settings.contrarian_expiry_grace_seconds}s\n"
+                f"리포트 주기 {self.settings.report_interval_minutes}분 | 즉시 알림 {self.instant_alerts_enabled}"
+            )
+        else:
+            text = (
+                "[운영 설정]\n"
+                f"모드 {mode} | DEMO_PAPER_HARDLOCK {self.settings.demo_paper_hardlock}\n"
+                f"슬러그 프리픽스 {self.settings.contrarian_market_slug_prefix}\n"
+                f"진입 간격 {self.settings.contrarian_entry_interval_seconds}s | 금액 {self.settings.contrarian_position_usd:.2f} USD\n"
+                f"최대 포지션 {self.settings.contrarian_max_positions} | 만기 그레이스 {self.settings.contrarian_expiry_grace_seconds}s\n"
+                f"리포트 주기 {self.settings.report_interval_minutes}분 | 시드 {self.settings.starting_capital_usd:.2f} USD"
+            )
+        await self._send_text(chat_id, text)
+
+    async def _cmd_pause(self, chat_id: int, args: str) -> None:
         self.runtime_state.paused = True
-        rejected = await self.execution_engine.reject_all_pending()
-        return f"[제어]\n일시정지 적용. 승인대기 {rejected}건 거절."
+        await self._send_text(chat_id, "[운영 제어]\n신규 진입을 일시 중지했습니다.")
 
-    async def _cmd_resume(self) -> str:
+    async def _cmd_resume(self, chat_id: int, args: str) -> None:
         self.runtime_state.paused = False
-        self.runtime_state.kill_switch = False
-        return "[제어]\n일시정지 해제. 킬스위치 OFF."
+        await self._send_text(chat_id, "[운영 제어]\n거래를 재개했습니다.")
 
-    async def _cmd_kill_on(self) -> str:
-        await self.risk_engine.activate_kill_switch("manual:/kill_on")
-        return "[긴급 제어]\n킬스위치 ON, 신규 진입 차단."
-
-    async def _cmd_kill_off(self) -> str:
-        self.runtime_state.kill_switch = False
-        return "[긴급 제어]\n킬스위치 OFF."
-
-    async def _cmd_go_live(self) -> str:
+    async def _cmd_go_live(self, chat_id: int, args: str) -> None:
         if self.settings.demo_paper_hardlock:
             self.runtime_state.trading_mode = TradingMode.PAPER
             self.runtime_state.manual_live_approved = False
-            return "[실거래 전환 불가]\n데모 모드에서 실거래 전환은 차단됩니다."
+            await self._send_text(chat_id, "[모드 전환 불가]\nDEMO_PAPER_HARDLOCK이 켜져 있어 LIVE로 전환할 수 없습니다.")
+            return
 
         hist_ok = await self.gatekeeper.historical_gate_passed()
         paper_ok = await self.gatekeeper.paper_gate_passed()
         if not (hist_ok and paper_ok):
-            reasons = []
+            reasons: list[str] = []
             if not hist_ok:
-                reasons.append("- 히스토리 60일 검증 미통과")
+                reasons.append("히스토리 게이트 미통과")
             if not paper_ok:
-                reasons.append("- Paper 3일 검증 미통과")
-            reason_text = "\n".join(reasons)
-            return f"[실거래 전환 불가]\n{reason_text}\n{await self.gatekeeper.summary_text()}"
+                reasons.append("페이퍼 게이트 미통과")
+            reason_text = "\n".join(f"- {reason}" for reason in reasons)
+            await self._send_text(chat_id, f"[모드 전환 불가]\n{reason_text}\n{await self.gatekeeper.summary_text()}")
+            return
 
         self.runtime_state.trading_mode = TradingMode.LIVE
         self.runtime_state.manual_live_approved = True
-        return "[모드 전환]\nLIVE 모드로 전환 완료."
+        await self._send_text(chat_id, "[모드 전환]\nLIVE 모드로 전환했습니다.")
 
-    async def _cmd_go_paper(self) -> str:
+    async def _cmd_go_paper(self, chat_id: int, args: str) -> None:
         self.runtime_state.trading_mode = TradingMode.PAPER
         self.runtime_state.manual_live_approved = False
-        return "[모드 전환]\nPAPER 모드로 전환 완료."
+        await self._send_text(chat_id, "[모드 전환]\nPAPER 모드로 전환했습니다.")
 
-    async def _cmd_set_minpos(self, arg: str) -> str:
-        value = self._parse_positive_float(arg)
+    async def _cmd_set_minpos(self, chat_id: int, args: str) -> None:
+        if not args:
+            await self._send_text(chat_id, "[사용법]\n/set_minpos <usd>\n예: /set_minpos 1.5")
+            return
+        value = self._parse_positive_float(args)
         if value is None:
-            return "[사용법]\n/set_minpos <usd>\n예) /set_minpos 1.5"
+            await self._send_text(chat_id, "[실패]\n숫자를 입력해 주세요. 예: /set_minpos 1.5")
+            return
         if value > float(self.settings.max_position_usd):
-            return f"[실패]\nMAX_POSITION_USD({self.settings.max_position_usd:.2f}) 초과 불가."
+            await self._send_text(
+                chat_id,
+                f"[실패]\n입력 값이 MAX_POSITION_USD({self.settings.max_position_usd:.2f})를 초과합니다.",
+            )
+            return
         self.runtime_state.min_position_usd_override = float(value)
-        return (
-            "[사이징]\n"
-            f"최소 진입금액 override 적용: {self.runtime_state.min_position_usd_override:.2f} USD"
+        await self._send_text(
+            chat_id,
+            f"[설정 변경]\n최소 진입 금액 override 적용: {self.runtime_state.min_position_usd_override:.2f} USD",
         )
 
-    async def _cmd_clear_minpos(self) -> str:
+    async def _cmd_clear_minpos(self, chat_id: int, args: str) -> None:
         self.runtime_state.min_position_usd_override = None
-        return "[사이징]\n최소 진입금액 override 해제."
+        await self._send_text(chat_id, "[설정 변경]\n최소 진입 금액 override를 해제했습니다.")
 
-    async def _cmd_tuning(self, arg: str) -> str:
-        if not self.settings.llm_enabled or not self.settings.llm_tuning_enabled:
-            return "[튜닝]\nLLM 튜닝 비활성 상태입니다."
-        if self.runtime_state.trading_mode != TradingMode.PAPER:
-            return "[튜닝]\nPAPER 모드에서만 사용 가능합니다."
-        healthy = await self.llm.health()
-        if not healthy:
-            return "[튜닝]\nLLM 브리지 상태 불가(health 실패)."
+    async def _cmd_reset_paper(self, chat_id: int, args: str) -> None:
+        strategy_ids = [STRATEGY_MODEL_A, STRATEGY_MODEL_B] if self.settings.ab_test_enabled else None
+        reset = await self.store.reset_paper_open_positions(strategy_ids=strategy_ids)
+        self.runtime_state.pending_approvals.clear()
+        self.runtime_state.recent_signals.clear()
+        self.runtime_state.recent_signal_candidate_sides.clear()
+        self.runtime_state.recent_signal_candidate_rejects.clear()
+        self.runtime_state.recent_approved_signal_sides.clear()
+        self.runtime_state.recent_no_guard_rejects.clear()
+        self.runtime_state.min_position_usd_override = None
+        self.runtime_state.auto_tune_zero_fill_applied = False
+        self.runtime_state.auto_tune_zero_fill_applied_at = None
+        self.runtime_state.auto_tune_zero_fill_last_outcome = None
+        self.runtime_state.auto_tune_zero_fill_last_checked_at = None
+        self.runtime_state.paused = False
+        self.runtime_state.manual_live_approved = False
 
-        goal = arg.strip() or "수익 개선"
-        summary = await self.store.signal_window_summary(window_minutes=self.settings.llm_tuning_window_minutes)
-        snapshot = await self.store.status_snapshot()
-        risk_state = await self.risk_engine.refresh_state()
+        if hasattr(self.gatekeeper, "_local_trades"):
+            self.gatekeeper._local_trades.clear()
+        if hasattr(self.gatekeeper, "_local_violations"):
+            self.gatekeeper._local_violations.clear()
 
-        allowlist = self._tuning_allowlist()
-        context = {
-            "window_minutes": int(self.settings.llm_tuning_window_minutes),
-            "signals": int(summary["total_signals"]),
-            "fills": int(summary["filled_signals"]),
-            "fill_rate": float(summary["fill_rate"]),
-            "yes_no": {"yes": int(summary["yes_signals"]), "no": int(summary["no_signals"])},
-            "reject_top": summary.get("reject_top", []),
-            "pnl_day": float(snapshot["day_pnl"]),
-            "pnl_week": float(snapshot["week_pnl"]),
-            "drawdown_day": float(risk_state.daily_drawdown_pct),
-            "drawdown_week": float(risk_state.weekly_drawdown_pct),
-            "params": {key: value["current"] for key, value in allowlist.items()},
-            "bounds": {key: {"min": value["min"], "max": value["max"]} for key, value in allowlist.items()},
-        }
+        await self.risk_engine.refresh_state()
+        await self._send_text(
+            chat_id,
+            "[초기화 완료]\n"
+            "PAPER 오픈 포지션과 런타임 상태를 초기화했습니다.\n"
+            f"닫은 포지션 {reset['positions_closed']}건, 구조물 레그 {reset['structure_legs_closed']}건.\n"
+            "주의: DB 히스토리는 유지됩니다. 완전 초기화는 DB/Redis 볼륨 리셋이 필요합니다.",
+        )
 
-        response = await self.llm.suggest_tuning(goal, context)
-        if not response.ok or response.payload is None:
-            return f"[튜닝]\nLLM 응답 실패: {response.error}"
-
-        changes = response.payload.get("changes") or []
-        if not isinstance(changes, list) or not changes:
-            return "[튜닝]\n변경 제안 없음."
-
-        max_changes = max(1, int(self.settings.llm_tuning_max_changes))
-        applied: list[str] = []
-        skipped: list[str] = []
-        for item in changes[:max_changes]:
-            if not isinstance(item, dict):
-                skipped.append("invalid_item")
-                continue
-            key = str(item.get("key") or "").strip().upper()
-            if key not in allowlist:
-                skipped.append(f"{key}:not_allowed")
-                continue
-            try:
-                value = float(item.get("value"))
-            except (TypeError, ValueError):
-                skipped.append(f"{key}:invalid_value")
-                continue
-            applied_line = self._apply_tuning_override(key, value, allowlist[key])
-            if applied_line is None:
-                skipped.append(f"{key}:no_change")
-                continue
-            applied.append(applied_line)
-
-        if not applied:
-            reason = ", ".join(skipped[:3]) if skipped else "no_change"
-            return f"[튜닝]\n적용 없음. 사유: {reason}"
-
-        self.runtime_state.tuning_last_applied_at = datetime.now(timezone.utc)
-        applied_text = "\n".join(applied[:5])
-        skipped_text = ""
-        if skipped:
-            skipped_text = "\n스킵 " + ", ".join(skipped[:5])
-        return f"[튜닝 적용]\n{applied_text}{skipped_text}"
-
-    async def _cmd_tuning_reset(self) -> str:
-        if not self.runtime_state.tuning_originals:
-            return "[튜닝 리셋]\n해제할 오버라이드가 없습니다."
-        for key, original in list(self.runtime_state.tuning_originals.items()):
-            attr = self._tuning_attr_from_key(key)
-            if attr:
-                setattr(self.settings, attr, original)
-        self.runtime_state.tuning_overrides.clear()
-        self.runtime_state.tuning_originals.clear()
-        self.runtime_state.tuning_last_applied_at = None
-        return "[튜닝 리셋]\n모든 런타임 오버라이드 해제."
-
-    async def _cmd_approve(self, arg: str) -> str:
-        signal_id = arg.strip()
+    async def _cmd_approve(self, chat_id: int, args: str) -> None:
+        signal_id = (args or "").strip()
         if not signal_id:
-            return "[사용법]\n/approve <signal_id>"
-        return await self.execution_engine.approve_signal(signal_id)
+            await self._send_text(chat_id, "[사용법]\n/approve <signal_id>")
+            return
+        await self._send_text(chat_id, await self.execution_engine.approve_signal(signal_id))
 
-    async def _cmd_reject(self, arg: str) -> str:
-        signal_id = arg.strip()
+    async def _cmd_reject(self, chat_id: int, args: str) -> None:
+        signal_id = (args or "").strip()
         if not signal_id:
-            return "[사용법]\n/reject <signal_id>"
-        return await self.execution_engine.reject_signal(signal_id)
+            await self._send_text(chat_id, "[사용법]\n/reject <signal_id>")
+            return
+        await self._send_text(chat_id, await self.execution_engine.reject_signal(signal_id))
 
-    async def _cmd_reject_all(self) -> str:
+    async def _cmd_reject_all(self, chat_id: int, args: str) -> None:
         count = await self.execution_engine.reject_all_pending()
-        return f"[승인 대기 정리]\n일괄 거절 {count}건 완료."
+        await self._send_text(chat_id, f"[승인 대기 정리]\n대기 신호 {count}건을 모두 거절했습니다.")
 
-    async def _cmd_close(self, arg: str) -> str:
-        position_id = self._parse_positive_int(arg, default=None, max_value=10_000_000)
+    async def _cmd_close(self, chat_id: int, args: str) -> None:
+        position_id = self._parse_positive_int(args, default=None, max_value=10_000_000)
         if position_id is None:
-            return "[사용법]\n/close <position_id>\n예) /close 123"
+            await self._send_text(chat_id, "[사용법]\n/close <position_id>\n예: /close 123")
+            return
         result = await self.execution_engine.force_close_position(position_id)
-        return self._render_close_result("포지션 강제 청산", result)
+        await self._send_text(chat_id, self._render_close_result("포지션 강제 청산", result))
 
-    async def _cmd_close_market(self, arg: str) -> str:
-        market_id = arg.strip()
+    async def _cmd_close_market(self, chat_id: int, args: str) -> None:
+        market_id = (args or "").strip()
         if not market_id:
-            return "[사용법]\n/close_market <market_id>"
+            await self._send_text(chat_id, "[사용법]\n/close_market <market_id>")
+            return
         result = await self.execution_engine.force_close_market(market_id)
-        return self._render_close_result(f"마켓 강제 청산 ({market_id})", result)
+        await self._send_text(chat_id, self._render_close_result(f"시장 강제 청산 ({market_id})", result))
 
-    async def _cmd_close_side(self, arg: str) -> str:
-        args = arg.strip().split()
-        if not args:
-            return "[사용법]\n/close_side <YES|NO> [limit]\n예) /close_side YES 5"
-        side = args[0].upper()
+    async def _cmd_close_side(self, chat_id: int, args: str) -> None:
+        raw = (args or "").strip()
+        if not raw:
+            await self._send_text(chat_id, "[사용법]\n/close_side <YES|NO> [limit]\n예: /close_side YES 5")
+            return
+        parts = raw.split()
+        side = parts[0].upper()
         if side not in {"YES", "NO"}:
-            return "[실패]\nside는 YES 또는 NO만 가능합니다."
+            await self._send_text(chat_id, "[실패]\nside는 YES 또는 NO만 가능합니다.")
+            return
         limit = None
-        if len(args) >= 2:
-            parsed = self._parse_positive_int(args[1], default=None, max_value=10_000)
+        if len(parts) >= 2:
+            parsed = self._parse_positive_int(parts[1], default=None, max_value=10_000)
             if parsed is None:
-                return "[실패]\nlimit은 양의 정수만 가능합니다."
+                await self._send_text(chat_id, "[실패]\nlimit은 양의 정수여야 합니다.")
+                return
             limit = parsed
         result = await self.execution_engine.force_close_side(side, limit=limit)
-        label = f"사이드 강제 청산 ({side}" + ("" if limit is None else f", limit={limit}") + ")"
-        return self._render_close_result(label, result)
+        label = f"방향 강제 청산 ({side}" + ("" if limit is None else f", limit={limit}") + ")"
+        await self._send_text(chat_id, self._render_close_result(label, result))
 
-    async def _cmd_closeall(self) -> str:
+    async def _cmd_closeall(self, chat_id: int, args: str) -> None:
         mode = TradingMode.PAPER if self.settings.demo_paper_hardlock else self.runtime_state.trading_mode
         rows = await self.store.get_open_positions(mode)
-        result = await self.execution_engine.force_close_positions(
-            [int(row.id) for row in rows],
-            reason="manual_close_all",
-        )
-        return self._render_close_result("전체 강제 청산", result)
+        result = await self.execution_engine.force_close_positions([int(row.id) for row in rows], reason="manual_close_all")
+        await self._send_text(chat_id, self._render_close_result("전체 강제 청산", result))
 
-    async def _cmd_panic(self) -> str:
+    async def _cmd_panic(self, chat_id: int, args: str) -> None:
         result = await self.execution_engine.emergency_stop(flatten=True)
         flat = result.get("flatten", {})
-        return (
-            "[긴급정지]\n"
-            f"paused={result.get('paused')} | kill_switch={result.get('kill_switch')}\n"
-            f"승인대기 거절 {result.get('rejected_pending')}건\n"
-            f"청산 요청 {flat.get('requested', 0)} | 청산 {flat.get('closed', 0)} | "
-            f"미존재 {flat.get('missing', 0)} | 가격없음 {flat.get('no_price', 0)}\n"
-            f"실현손익 {float(flat.get('realized_pnl_usd', 0.0)):+.2f} USD"
+        await self._send_text(
+            chat_id,
+            "[긴급 중지]\n"
+            f"paused={result.get('paused')}\n"
+            f"승인 대기 거절 {result.get('rejected_pending')}건\n"
+            f"청산 요청 {flat.get('requested', 0)} | 청산 {flat.get('closed', 0)} | 미존재 {flat.get('missing', 0)} | 가격없음 {flat.get('no_price', 0)}\n"
+            f"실현 손익 {float(flat.get('realized_pnl_usd', 0.0)):+.2f} USD",
         )
 
-    async def _build_position_views(self, rows: list, limit: int) -> tuple[list[dict[str, Any]], float]:
+    async def _build_position_views(self, limit: int, strategy_id: str | None = None) -> tuple[list[PositionView], float]:
+        rows = await self.store.get_open_positions(self.runtime_state.trading_mode, strategy_id=strategy_id)
         market_ids = [str(row.market_id) for row in rows]
         prices = await self.store.latest_market_prices(market_ids)
         questions = await self.store.market_questions(market_ids)
 
-        views: list[dict[str, Any]] = []
+        views: list[PositionView] = []
         unrealized_total = 0.0
         for idx, row in enumerate(rows[:limit], start=1):
             side = str(row.side).upper()
@@ -532,19 +553,69 @@ class TelegramBotService:
             unrealized = (shares * mark_price) - float(row.size_usd)
             unrealized_total += unrealized
             views.append(
-                {
-                    "index": idx,
-                    "position_id": int(row.id),
-                    "market_id": market_id,
-                    "side": side,
-                    "size_usd": float(row.size_usd),
-                    "entry_price": float(row.entry_price),
-                    "mark_price": float(mark_price),
-                    "unrealized_pnl_usd": float(unrealized),
-                    "question": questions.get(market_id, "").strip(),
-                }
+                PositionView(
+                    index=idx,
+                    position_id=int(row.id),
+                    market_id=market_id,
+                    side=side,
+                    size_usd=float(row.size_usd),
+                    entry_price=float(row.entry_price),
+                    mark_price=float(mark_price),
+                    unrealized_pnl_usd=float(unrealized),
+                    question=questions.get(market_id, "").strip(),
+                    strategy_id=str(getattr(row, "strategy_id", "") or ""),
+                )
             )
         return views, unrealized_total
+
+    async def _build_ab_pnl_text(self) -> str:
+        a_snapshot = await self.store.status_snapshot(strategy_id=STRATEGY_MODEL_A)
+        b_snapshot = await self.store.status_snapshot(strategy_id=STRATEGY_MODEL_B)
+        _, a_unrealized = await self._build_position_views(limit=10_000, strategy_id=STRATEGY_MODEL_A)
+        _, b_unrealized = await self._build_position_views(limit=10_000, strategy_id=STRATEGY_MODEL_B)
+        a_total = float(a_snapshot["total_pnl"]) + a_unrealized
+        b_total = float(b_snapshot["total_pnl"]) + b_unrealized
+        capital = max(1.0, float(self.settings.model_portfolio_starting_capital_usd))
+        return (
+            "[손익 요약]\n"
+            f"모델 A | 일간 {a_snapshot['day_pnl']:+.2f} | 주간 {a_snapshot['week_pnl']:+.2f} | 미실현 {a_unrealized:+.2f} | 누적 {a_total:+.2f} USD ({a_total / capital:+.2%})\n"
+            f"모델 B | 일간 {b_snapshot['day_pnl']:+.2f} | 주간 {b_snapshot['week_pnl']:+.2f} | 미실현 {b_unrealized:+.2f} | 누적 {b_total:+.2f} USD ({b_total / capital:+.2%})"
+        )
+
+    def _parse_positions_args(self, args: str) -> tuple[str | None, int | None]:
+        raw = (args or "").strip()
+        if not self.settings.ab_test_enabled:
+            limit = self._parse_positive_int(raw, default=10, max_value=40)
+            return None, limit
+
+        if not raw:
+            return None, 10
+        parts = raw.split()
+        strategy_id = self._parse_strategy_token(parts[0])
+        if strategy_id is None:
+            return None, None
+        limit_raw = parts[1] if len(parts) >= 2 else "10"
+        limit = self._parse_positive_int(limit_raw, default=10, max_value=40)
+        return strategy_id, limit
+
+    @staticmethod
+    def _parse_strategy_token(token: str | None) -> str | None:
+        if token is None:
+            return None
+        text = token.strip().lower()
+        if text in {"a", "model_a", "modela", "model_a_contrarian"}:
+            return STRATEGY_MODEL_A
+        if text in {"b", "model_b", "modelb", "model_b_ensemble"}:
+            return STRATEGY_MODEL_B
+        return None
+
+    @staticmethod
+    def _strategy_label(strategy_id: str | None) -> str:
+        if strategy_id == STRATEGY_MODEL_A:
+            return "모델 A"
+        if strategy_id == STRATEGY_MODEL_B:
+            return "모델 B"
+        return "전체"
 
     @staticmethod
     def _parse_positive_int(raw: str | None, default: int | None, max_value: int) -> int | None:
@@ -587,215 +658,12 @@ class TelegramBotService:
         if error:
             return (
                 f"[{title}]\n"
-                f"모드 {str(result.get('mode')).upper()} | 실패사유 {error}\n"
+                f"모드 {str(result.get('mode')).upper()} | 실패 사유 {error}\n"
                 f"요청 {result.get('requested', 0)} | 청산 {result.get('closed', 0)}"
             )
         return (
             f"[{title}]\n"
             f"모드 {str(result.get('mode')).upper()}\n"
-            f"요청 {result.get('requested', 0)} | 청산 {result.get('closed', 0)} | "
-            f"미존재 {result.get('missing', 0)} | 가격없음 {result.get('no_price', 0)}\n"
-            f"실현손익 {float(result.get('realized_pnl_usd', 0.0)):+.2f} USD"
+            f"요청 {result.get('requested', 0)} | 청산 {result.get('closed', 0)} | 미존재 {result.get('missing', 0)} | 가격없음 {result.get('no_price', 0)}\n"
+            f"실현 손익 {float(result.get('realized_pnl_usd', 0.0)):+.2f} USD"
         )
-
-    def _tuning_allowlist(self) -> dict[str, dict[str, float]]:
-        base = {
-            "MIN_POSITION_USD": {
-                "attr": "min_position_usd",
-                "min": float(self.settings.auto_threshold_tune_min_position_usd_min),
-                "max": float(self.settings.auto_threshold_tune_min_position_usd_max),
-                "current": float(self.settings.min_position_usd),
-            },
-            "SIGNAL_MIN_NET_EV": {
-                "attr": "signal_min_net_ev",
-                "min": float(self.settings.auto_threshold_tune_min_net_ev),
-                "max": float(self.settings.auto_threshold_tune_max_net_ev),
-                "current": float(self.settings.signal_min_net_ev),
-            },
-            "SIGNAL_MIN_CONTRACT_PRICE": {
-                "attr": "signal_min_contract_price",
-                "min": float(self.settings.auto_threshold_tune_min_contract_price_min),
-                "max": float(self.settings.auto_threshold_tune_min_contract_price_max),
-                "current": float(self.settings.signal_min_contract_price),
-            },
-            "AUTO_THRESHOLD_TUNE_WINDOW_MINUTES": {
-                "attr": "auto_threshold_tune_window_minutes",
-                "min": 30.0,
-                "max": 240.0,
-                "current": float(self.settings.auto_threshold_tune_window_minutes),
-            },
-            "AUTO_THRESHOLD_TUNE_MIN_SIGNALS": {
-                "attr": "auto_threshold_tune_min_signals",
-                "min": 5.0,
-                "max": 200.0,
-                "current": float(self.settings.auto_threshold_tune_min_signals),
-            },
-            "AUTO_THRESHOLD_TUNE_FILLRATE_LOW": {
-                "attr": "auto_threshold_tune_fillrate_low",
-                "min": 0.05,
-                "max": 0.6,
-                "current": float(self.settings.auto_threshold_tune_fillrate_low),
-            },
-            "AUTO_THRESHOLD_TUNE_FILLRATE_HIGH": {
-                "attr": "auto_threshold_tune_fillrate_high",
-                "min": 0.2,
-                "max": 0.95,
-                "current": float(self.settings.auto_threshold_tune_fillrate_high),
-            },
-            "AUTO_THRESHOLD_TUNE_STEP_NET_EV": {
-                "attr": "auto_threshold_tune_step_net_ev",
-                "min": 0.000001,
-                "max": 0.001,
-                "current": float(self.settings.auto_threshold_tune_step_net_ev),
-            },
-            "AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE": {
-                "attr": "auto_threshold_tune_step_min_price",
-                "min": 0.0001,
-                "max": 0.01,
-                "current": float(self.settings.auto_threshold_tune_step_min_price),
-            },
-            "AUTO_THRESHOLD_TUNE_STEP_MIN_USD": {
-                "attr": "auto_threshold_tune_step_min_usd",
-                "min": 0.1,
-                "max": 5.0,
-                "current": float(self.settings.auto_threshold_tune_step_min_usd),
-            },
-            "AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES": {
-                "attr": "auto_threshold_tune_cooldown_minutes",
-                "min": 5.0,
-                "max": 240.0,
-                "current": float(self.settings.auto_threshold_tune_cooldown_minutes),
-            },
-            "SIGNAL_MIN_CONFIDENCE": {
-                "attr": "signal_min_confidence",
-                "min": 0.05,
-                "max": 0.5,
-                "current": float(self.settings.signal_min_confidence),
-            },
-            "SIGNAL_MIN_QUALITY": {
-                "attr": "signal_min_quality",
-                "min": 0.05,
-                "max": 0.5,
-                "current": float(self.settings.signal_min_quality),
-            },
-            "SIGNAL_MIN_RISK_ADJ_EDGE": {
-                "attr": "signal_min_risk_adj_edge",
-                "min": 0.0001,
-                "max": 0.01,
-                "current": float(self.settings.signal_min_risk_adj_edge),
-            },
-            "SIGNAL_MIN_TTE_HOURS": {
-                "attr": "signal_min_tte_hours",
-                "min": 0.1,
-                "max": 24.0,
-                "current": float(self.settings.signal_min_tte_hours),
-            },
-            "SIGNAL_LONG_TTE_MIN_EDGE": {
-                "attr": "signal_long_tte_min_edge",
-                "min": 0.001,
-                "max": 0.02,
-                "current": float(self.settings.signal_long_tte_min_edge),
-            },
-            "SIGNAL_MID_BAND_MIN_NET_EV": {
-                "attr": "signal_mid_band_min_net_ev",
-                "min": 0.0002,
-                "max": 0.01,
-                "current": float(self.settings.signal_mid_band_min_net_ev),
-            },
-            "SIGNAL_TAIL_PROB_FLOOR": {
-                "attr": "signal_tail_prob_floor",
-                "min": 0.01,
-                "max": 0.2,
-                "current": float(self.settings.signal_tail_prob_floor),
-            },
-            "SIGNAL_TAIL_PROB_CEILING": {
-                "attr": "signal_tail_prob_ceiling",
-                "min": 0.8,
-                "max": 0.99,
-                "current": float(self.settings.signal_tail_prob_ceiling),
-            },
-            "SIGNAL_TAIL_EXTRA_NET_EV": {
-                "attr": "signal_tail_extra_net_ev",
-                "min": 0.0001,
-                "max": 0.01,
-                "current": float(self.settings.signal_tail_extra_net_ev),
-            },
-            "SIGNAL_YES_PRIORITY_MARGIN": {
-                "attr": "signal_yes_priority_margin",
-                "min": 0.0001,
-                "max": 0.01,
-                "current": float(self.settings.signal_yes_priority_margin),
-            },
-        }
-        allow = self._parse_csv_set(self.settings.llm_tuning_allowlist)
-        block = self._parse_csv_set(self.settings.llm_tuning_blocklist)
-        if allow:
-            base = {key: value for key, value in base.items() if key in allow}
-        if block:
-            base = {key: value for key, value in base.items() if key not in block}
-        return base
-
-    @staticmethod
-    def _tuning_attr_from_key(key: str) -> str | None:
-        mapping = {
-            "MIN_POSITION_USD": "min_position_usd",
-            "SIGNAL_MIN_NET_EV": "signal_min_net_ev",
-            "SIGNAL_MIN_CONTRACT_PRICE": "signal_min_contract_price",
-            "AUTO_THRESHOLD_TUNE_WINDOW_MINUTES": "auto_threshold_tune_window_minutes",
-            "AUTO_THRESHOLD_TUNE_MIN_SIGNALS": "auto_threshold_tune_min_signals",
-            "AUTO_THRESHOLD_TUNE_FILLRATE_LOW": "auto_threshold_tune_fillrate_low",
-            "AUTO_THRESHOLD_TUNE_FILLRATE_HIGH": "auto_threshold_tune_fillrate_high",
-            "AUTO_THRESHOLD_TUNE_STEP_NET_EV": "auto_threshold_tune_step_net_ev",
-            "AUTO_THRESHOLD_TUNE_STEP_MIN_PRICE": "auto_threshold_tune_step_min_price",
-            "AUTO_THRESHOLD_TUNE_STEP_MIN_USD": "auto_threshold_tune_step_min_usd",
-            "AUTO_THRESHOLD_TUNE_COOLDOWN_MINUTES": "auto_threshold_tune_cooldown_minutes",
-            "SIGNAL_MIN_CONFIDENCE": "signal_min_confidence",
-            "SIGNAL_MIN_QUALITY": "signal_min_quality",
-            "SIGNAL_MIN_RISK_ADJ_EDGE": "signal_min_risk_adj_edge",
-            "SIGNAL_MIN_TTE_HOURS": "signal_min_tte_hours",
-            "SIGNAL_LONG_TTE_MIN_EDGE": "signal_long_tte_min_edge",
-            "SIGNAL_MID_BAND_MIN_NET_EV": "signal_mid_band_min_net_ev",
-            "SIGNAL_TAIL_PROB_FLOOR": "signal_tail_prob_floor",
-            "SIGNAL_TAIL_PROB_CEILING": "signal_tail_prob_ceiling",
-            "SIGNAL_TAIL_EXTRA_NET_EV": "signal_tail_extra_net_ev",
-            "SIGNAL_YES_PRIORITY_MARGIN": "signal_yes_priority_margin",
-        }
-        return mapping.get(key)
-
-    def _apply_tuning_override(self, key: str, value: float, spec: dict[str, float]) -> str | None:
-        attr = str(spec["attr"])
-        minimum = float(spec["min"])
-        maximum = float(spec["max"])
-        new_value = max(minimum, min(maximum, float(value)))
-        if attr.endswith("_minutes") or attr.endswith("_signals"):
-            new_value = float(int(new_value))
-        if attr == "auto_threshold_tune_fillrate_high":
-            low = float(self.settings.auto_threshold_tune_fillrate_low)
-            if new_value <= low:
-                new_value = min(0.95, max(low + 0.05, new_value))
-        if attr == "auto_threshold_tune_fillrate_low":
-            high = float(self.settings.auto_threshold_tune_fillrate_high)
-            if new_value >= high:
-                new_value = max(0.05, min(high - 0.05, new_value))
-        if attr == "signal_tail_prob_floor":
-            ceiling = float(self.settings.signal_tail_prob_ceiling)
-            if new_value >= ceiling:
-                new_value = max(0.01, min(ceiling - 0.01, new_value))
-        if attr == "signal_tail_prob_ceiling":
-            floor = float(self.settings.signal_tail_prob_floor)
-            if new_value <= floor:
-                new_value = min(0.99, max(floor + 0.01, new_value))
-        current = float(getattr(self.settings, attr))
-        if abs(current - new_value) < 1e-12:
-            return None
-        if key not in self.runtime_state.tuning_originals:
-            self.runtime_state.tuning_originals[key] = current
-        setattr(self.settings, attr, new_value)
-        self.runtime_state.tuning_overrides[key] = new_value
-        return f"{key} {current:.6f}->{new_value:.6f}"
-
-    @staticmethod
-    def _parse_csv_set(raw: str) -> set[str]:
-        if not raw:
-            return set()
-        return {item.strip().upper() for item in raw.split(",") if item.strip()}

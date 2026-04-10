@@ -6,7 +6,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from polymethemoney.config import Settings
-from polymethemoney.domain import FeatureVector, Side, Signal
+from polymethemoney.domain import STRATEGY_LEGACY, FeatureVector, Side, Signal
 from polymethemoney.services.execution_engine import ExecutionEngine
 from polymethemoney.services.model_engine import ModelEngine
 from polymethemoney.state import RuntimeState, TimedReasonEvent
@@ -165,6 +165,7 @@ class SignalEngine:
         score = max(0, min(100, score))
 
         signal = Signal(
+            strategy_id=STRATEGY_LEGACY,
             market_id=fv.market_id,
             side=side,
             fair_prob=max(0.001, min(0.999, fair)),

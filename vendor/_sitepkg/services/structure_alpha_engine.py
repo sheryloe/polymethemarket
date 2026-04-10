@@ -53,7 +53,7 @@ class StructureAlphaService:
         if not self.settings.arb_enabled:
             return
         await self._try_early_exit()
-        if self.runtime_state.kill_switch or self.runtime_state.paused:
+        if self.runtime_state.paused:
             await self._refresh_runtime_metrics()
             return
         opportunities = await self._discover_opportunities()

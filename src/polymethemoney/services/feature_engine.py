@@ -18,22 +18,23 @@ class FeatureEngine:
         self,
         store: Store,
         tick_queue: asyncio.Queue[MarketTick],
-        feature_queue: asyncio.Queue[FeatureVector],
+        feature_queues: list[asyncio.Queue[FeatureVector]],
         paper_exchange: PaperExchange,
     ) -> None:
         self.store = store
         self.tick_queue = tick_queue
-        self.feature_queue = feature_queue
+        self.feature_queues = feature_queues
         self.paper_exchange = paper_exchange
         self._price_windows: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=120))
 
     async def run(self) -> None:
         while True:
             tick = await self.tick_queue.get()
-            self.paper_exchange.on_tick(tick)
+            await self.paper_exchange.on_tick(tick)
             feature = self._build_feature(tick)
             await self.store.add_feature(feature)
-            await self.feature_queue.put(feature)
+            for queue in self.feature_queues:
+                await queue.put(feature)
 
     def _build_feature(self, tick: MarketTick) -> FeatureVector:
         mid = max(0.001, min(0.999, (tick.bid + tick.ask) / 2.0))

@@ -16,3 +16,9 @@ __pycache__/
 
 # Vendor cache
 vendor/awesome-codex-subagents/
+
+# Codex optimization gate (2026-04-10)
+* (1).py
+_ps_utf8.txt
+_utf8_test.txt
+korean_test*.txt

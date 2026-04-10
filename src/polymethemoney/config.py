@@ -9,6 +9,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        protected_namespaces=("settings_",),
     )
 
     app_name: str = Field(default="polymethemoney", alias="APP_NAME")
@@ -23,8 +24,8 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://redis:6379/0", alias="REDIS_URL")
 
     starting_capital_usd: float = Field(default=4000.0, alias="STARTING_CAPITAL_USD")
-    max_positions: int = Field(default=100, alias="MAX_POSITIONS")
-    max_position_usd: float = Field(default=5.0, alias="MAX_POSITION_USD")
+    max_positions: int = Field(default=200, alias="MAX_POSITIONS")
+    max_position_usd: float = Field(default=10000.0, alias="MAX_POSITION_USD")
     min_position_usd: float = Field(default=5.0, alias="MIN_POSITION_USD")
     kelly_fraction: float = Field(default=0.25, alias="KELLY_FRACTION")
     fixed_position_usd: float = Field(default=5.0, alias="FIXED_POSITION_USD")
@@ -56,6 +57,37 @@ class Settings(BaseSettings):
         default="https://api.bybit.com/v5/market/tickers",
         alias="PAPER_BYBIT_TICKERS_URL",
     )
+
+    contrarian_enabled: bool = Field(default=False, alias="CONTRARIAN_ENABLED")
+    contrarian_market_slug_prefix: str = Field(default="btc-updown-5m-", alias="CONTRARIAN_MARKET_SLUG_PREFIX")
+    contrarian_entry_interval_seconds: int = Field(default=60, alias="CONTRARIAN_ENTRY_INTERVAL_SECONDS")
+    contrarian_position_usd: float = Field(default=100.0, alias="CONTRARIAN_POSITION_USD")
+    contrarian_max_positions: int = Field(default=5, alias="CONTRARIAN_MAX_POSITIONS")
+    contrarian_expiry_grace_seconds: int = Field(default=10, alias="CONTRARIAN_EXPIRY_GRACE_SECONDS")
+    ab_test_enabled: bool = Field(default=False, alias="AB_TEST_ENABLED")
+    model_portfolio_starting_capital_usd: float = Field(default=10000.0, alias="MODEL_PORTFOLIO_STARTING_CAPITAL_USD")
+    model_position_usd: float = Field(default=1000.0, alias="MODEL_POSITION_USD")
+    model_max_positions: int = Field(default=5, alias="MODEL_MAX_POSITIONS")
+    model_a_dist_from_mid_weight: float = Field(default=0.018, alias="MODEL_A_DIST_FROM_MID_WEIGHT")
+    model_a_abs_dist_from_mid_weight: float = Field(default=-0.010, alias="MODEL_A_ABS_DIST_FROM_MID_WEIGHT")
+    model_a_spread_to_mid_weight: float = Field(default=-0.012, alias="MODEL_A_SPREAD_TO_MID_WEIGHT")
+    model_a_spread_to_tte_weight: float = Field(default=-0.008, alias="MODEL_A_SPREAD_TO_TTE_WEIGHT")
+    model_a_log_volume_1h_weight: float = Field(default=0.010, alias="MODEL_A_LOG_VOLUME_1H_WEIGHT")
+    model_a_log_open_interest_weight: float = Field(default=0.008, alias="MODEL_A_LOG_OPEN_INTEREST_WEIGHT")
+    model_a_volume_pressure_weight: float = Field(default=0.020, alias="MODEL_A_VOLUME_PRESSURE_WEIGHT")
+    model_a_imbalance_abs_weight: float = Field(default=0.006, alias="MODEL_A_IMBALANCE_ABS_WEIGHT")
+    model_a_imbalance_momentum_align_weight: float = Field(default=0.024, alias="MODEL_A_IMBALANCE_MOMENTUM_ALIGN_WEIGHT")
+    model_a_imbalance_zscore_align_weight: float = Field(default=0.016, alias="MODEL_A_IMBALANCE_ZSCORE_ALIGN_WEIGHT")
+    model_a_momentum_abs_weight: float = Field(default=0.010, alias="MODEL_A_MOMENTUM_ABS_WEIGHT")
+    model_a_zscore_abs_weight: float = Field(default=-0.006, alias="MODEL_A_ZSCORE_ABS_WEIGHT")
+    model_a_vol_ratio_20_30_weight: float = Field(default=-0.012, alias="MODEL_A_VOL_RATIO_20_30_WEIGHT")
+    model_a_momentum_vol_adj_weight: float = Field(default=0.020, alias="MODEL_A_MOMENTUM_VOL_ADJ_WEIGHT")
+    model_a_zscore_vol_adj_weight: float = Field(default=-0.014, alias="MODEL_A_ZSCORE_VOL_ADJ_WEIGHT")
+    model_a_expiry_pressure_weight: float = Field(default=0.018, alias="MODEL_A_EXPIRY_PRESSURE_WEIGHT")
+    model_a_tail_prob_flag_weight: float = Field(default=-0.010, alias="MODEL_A_TAIL_PROB_FLAG_WEIGHT")
+    model_a_mid_prob_flag_weight: float = Field(default=0.012, alias="MODEL_A_MID_PROB_FLAG_WEIGHT")
+    model_a_revert_pressure_weight: float = Field(default=-0.020, alias="MODEL_A_REVERT_PRESSURE_WEIGHT")
+    model_a_shock_flag_weight: float = Field(default=-0.016, alias="MODEL_A_SHOCK_FLAG_WEIGHT")
 
     auto_threshold: int = Field(default=45, alias="AUTO_THRESHOLD")
     semi_threshold: int = Field(default=70, alias="SEMI_THRESHOLD")
@@ -156,7 +188,7 @@ class Settings(BaseSettings):
         default=6.0, alias="AUTO_THRESHOLD_TUNE_MIN_POSITION_USD_MAX"
     )
     paper_perf_tune_enabled: bool = Field(default=True, alias="PAPER_PERF_TUNE_ENABLED")
-    paper_perf_tune_interval_hours: int = Field(default=3, alias="PAPER_PERF_TUNE_INTERVAL_HOURS")
+    paper_perf_tune_interval_hours: int = Field(default=6, alias="PAPER_PERF_TUNE_INTERVAL_HOURS")
     paper_perf_tune_interval_hours_secondary: int = Field(default=12, alias="PAPER_PERF_TUNE_INTERVAL_HOURS_SECONDARY")
     paper_perf_tune_min_pnl_usd: float = Field(default=1.0, alias="PAPER_PERF_TUNE_MIN_PNL_USD")
     paper_perf_tune_min_trades: int = Field(default=1, alias="PAPER_PERF_TUNE_MIN_TRADES")

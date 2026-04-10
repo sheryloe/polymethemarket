@@ -53,3 +53,26 @@ async def init_db(engine: AsyncEngine) -> None:
         await conn.execute(
             text("ALTER TABLE features ADD COLUMN IF NOT EXISTS volatility_20 DOUBLE PRECISION")
         )
+        await conn.execute(
+            text("ALTER TABLE features ADD COLUMN IF NOT EXISTS volatility_30 DOUBLE PRECISION")
+        )
+        await conn.execute(
+            text("ALTER TABLE signals ADD COLUMN IF NOT EXISTS strategy_id VARCHAR(64) DEFAULT 'legacy'")
+        )
+        await conn.execute(
+            text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS strategy_id VARCHAR(64) DEFAULT 'legacy'")
+        )
+        await conn.execute(
+            text("ALTER TABLE fills ADD COLUMN IF NOT EXISTS strategy_id VARCHAR(64) DEFAULT 'legacy'")
+        )
+        await conn.execute(
+            text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy_id VARCHAR(64) DEFAULT 'legacy'")
+        )
+        await conn.execute(
+            text("ALTER TABLE equity_curve ADD COLUMN IF NOT EXISTS strategy_id VARCHAR(64) DEFAULT 'legacy'")
+        )
+        await conn.execute(text("UPDATE signals SET strategy_id='legacy' WHERE strategy_id IS NULL"))
+        await conn.execute(text("UPDATE orders SET strategy_id='legacy' WHERE strategy_id IS NULL"))
+        await conn.execute(text("UPDATE fills SET strategy_id='legacy' WHERE strategy_id IS NULL"))
+        await conn.execute(text("UPDATE positions SET strategy_id='legacy' WHERE strategy_id IS NULL"))
+        await conn.execute(text("UPDATE equity_curve SET strategy_id='legacy' WHERE strategy_id IS NULL"))

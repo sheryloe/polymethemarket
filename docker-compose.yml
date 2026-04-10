@@ -1,6 +1,6 @@
 ﻿services:
   polymethemoney_postgres:
-    image: polymethemoney_postgres:16
+    image: postgres:16-alpine
     container_name: polymethemoney_postgres
     restart: unless-stopped
     environment:
@@ -20,7 +20,7 @@
           - postgres
 
   polymethemoney_redis:
-    image: polymethemoney_redis:7
+    image: redis:7-alpine
     container_name: polymethemoney_redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
@@ -32,7 +32,10 @@
           - redis
 
   polymethemoney_app:
-    image: polymethemoney_app:latest
+    image: polymethemoney_app:slim
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: polymethemoney_app
     restart: unless-stopped
     env_file:
@@ -45,7 +48,6 @@
         condition: service_started
     volumes:
       - ./data:/app/data
-      - ./src:/app/src
     networks:
       - default
 

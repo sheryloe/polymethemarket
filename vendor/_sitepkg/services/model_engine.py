@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -16,7 +17,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from polymethemoney.config import Settings
-from polymethemoney.domain import DualModelScore, FeatureVector
+from polymethemoney.domain import (
+    STRATEGY_MODEL_A,
+    STRATEGY_MODEL_B,
+    DualModelScore,
+    FeatureVector,
+)
 from polymethemoney.storage import Store
 
 logger = logging.getLogger(__name__)
@@ -163,12 +169,31 @@ class ModelEngine:
         settlement_anchor = (fv.implied_prob * (1.0 - settlement_weight)) + (settlement_prob * settlement_weight)
         intraday_base_rate = self.intraday_bundle.positive_rate if self.intraday_bundle else 0.5
         intraday_fair = self._intraday_fair_probability(fv, intraday_up_prob, intraday_base_rate)
+        trend_bias = self._trend_bias(fv)
+        trend_strength = self._trend_strength(fv)
+        trend_anchor = self._trend_anchor_probability(fv, trend_bias, trend_strength)
+        settlement_anchor = self._blend_probability(
+            settlement_anchor,
+            trend_anchor,
+            min(0.72, 0.20 + (0.20 * trend_strength)),
+        )
+        intraday_fair = self._blend_probability(
+            intraday_fair,
+            trend_anchor,
+            min(0.88, 0.35 + (0.35 * trend_strength) + (0.10 * (1.0 - settlement_weight))),
+        )
         blended = (settlement_anchor * settlement_weight) + (intraday_fair * (1.0 - settlement_weight))
+        blended = self._blend_probability(
+            blended,
+            trend_anchor,
+            min(0.85, 0.25 + (0.35 * trend_strength)),
+        )
 
         disagreement = abs(settlement_anchor - intraday_fair)
         dist = abs(blended - fv.implied_prob)
         base_conf = 0.65 * intraday_conf + 0.35 * settlement_conf
         confidence = base_conf * (1.0 - min(1.0, disagreement * 1.5)) * min(1.0, 0.25 + (dist / 0.14))
+        confidence = confidence * (0.60 + 0.40 * trend_strength) + (0.08 * abs(trend_bias))
         confidence = float(max(0.05, min(0.99, confidence)))
         return DualModelScore(
             settlement_prob=float(max(0.001, min(0.999, settlement_anchor))),
@@ -180,11 +205,151 @@ class ModelEngine:
     def predict_fair_probability(self, fv: FeatureVector) -> float:
         return self.predict(fv).fair_probability
 
+    def predict_strategy(self, strategy_id: str, fv: FeatureVector) -> ModelPrediction:
+        if strategy_id == STRATEGY_MODEL_B:
+            return self.predict_model_b(fv)
+        return self.predict_model_a(fv)
+
+    def predict_model_a(self, fv: FeatureVector) -> ModelPrediction:
+        base = self.predict_dual_score(fv)
+        derived = self.derive_strategy_features(fv)
+        weights = {
+            "dist_from_mid": self.settings.model_a_dist_from_mid_weight,
+            "abs_dist_from_mid": self.settings.model_a_abs_dist_from_mid_weight,
+            "spread_to_mid": self.settings.model_a_spread_to_mid_weight,
+            "spread_to_tte": self.settings.model_a_spread_to_tte_weight,
+            "log_volume_1h": self.settings.model_a_log_volume_1h_weight,
+            "log_open_interest": self.settings.model_a_log_open_interest_weight,
+            "volume_pressure": self.settings.model_a_volume_pressure_weight,
+            "imbalance_abs": self.settings.model_a_imbalance_abs_weight,
+            "imbalance_momentum_align": self.settings.model_a_imbalance_momentum_align_weight,
+            "imbalance_zscore_align": self.settings.model_a_imbalance_zscore_align_weight,
+            "momentum_abs": self.settings.model_a_momentum_abs_weight,
+            "zscore_abs": self.settings.model_a_zscore_abs_weight,
+            "vol_ratio_20_30": self.settings.model_a_vol_ratio_20_30_weight,
+            "momentum_vol_adj": self.settings.model_a_momentum_vol_adj_weight,
+            "zscore_vol_adj": self.settings.model_a_zscore_vol_adj_weight,
+            "expiry_pressure": self.settings.model_a_expiry_pressure_weight,
+            "tail_prob_flag": self.settings.model_a_tail_prob_flag_weight,
+            "mid_prob_flag": self.settings.model_a_mid_prob_flag_weight,
+            "revert_pressure": self.settings.model_a_revert_pressure_weight,
+            "shock_flag": self.settings.model_a_shock_flag_weight,
+        }
+        adjustment = sum(float(weights[name]) * float(derived[name]) for name in weights)
+        fair = self._clip_probability(float(base.blended_prob) + adjustment)
+        confidence = float(base.confidence)
+        confidence += min(0.16, abs(adjustment) * 2.6)
+        confidence -= min(0.05, float(derived["shock_flag"]) * 0.05)
+        confidence = float(max(0.05, min(0.99, confidence)))
+        return ModelPrediction(fair_probability=fair, confidence=confidence)
+
+    def predict_model_b(self, fv: FeatureVector) -> ModelPrediction:
+        derived = self.derive_strategy_features(fv)
+        implied = self._clip_probability(float(fv.implied_prob))
+        direction = 1.0 if implied >= 0.5 else -1.0
+
+        market_prior = implied
+        trend_prob = self._clip_probability(
+            implied
+            + (0.13 * math.tanh(
+                (2.4 * float(derived["momentum_vol_adj"]))
+                + (1.3 * float(derived["imbalance_momentum_align"]))
+                + (0.9 * float(derived["vol_ratio_20_30"]))
+            ))
+        )
+        mean_revert_prob = self._clip_probability(
+            implied
+            + (0.11 * math.tanh(
+                (-1.4 * float(derived["zscore_vol_adj"]))
+                + (1.2 * float(derived["revert_pressure"]))
+                - (0.8 * float(derived["shock_flag"]))
+            ))
+        )
+        expiry_prob = self._clip_probability(
+            (implied * (1.0 - (0.28 * float(derived["expiry_pressure"]))))
+            + (0.5 * (0.28 * float(derived["expiry_pressure"])))
+            - (0.04 * float(derived["spread_to_tte"]))
+            + (0.025 * float(derived["mid_prob_flag"]) * direction)
+        )
+        flow_strength = 0.10 * math.tanh(
+            (1.2 * float(derived["volume_pressure"]))
+            + (0.9 * float(derived["log_volume_1h"]))
+            + (0.7 * float(derived["log_open_interest"]))
+            + (0.6 * float(derived["imbalance_abs"]))
+        )
+        flow_prob = self._clip_probability(implied + (direction * flow_strength))
+
+        probabilities = np.array(
+            [market_prior, trend_prob, mean_revert_prob, expiry_prob, flow_prob],
+            dtype=np.float64,
+        )
+        weights = np.array([0.30, 0.23, 0.17, 0.15, 0.15], dtype=np.float64)
+        fair = self._clip_probability(float(np.average(probabilities, weights=weights)))
+
+        dispersion = float(np.std(probabilities))
+        edge = abs(fair - implied)
+        confidence = 0.18 + min(0.42, edge / 0.12) + max(0.0, 0.30 - min(0.30, dispersion * 1.8))
+        confidence = float(max(0.05, min(0.99, confidence)))
+        return ModelPrediction(fair_probability=fair, confidence=confidence)
+
+    def derive_strategy_features(self, fv: FeatureVector) -> dict[str, float]:
+        implied = self._clip_probability(float(fv.implied_prob))
+        dist_from_mid = self._clip_symmetric((implied - 0.5) / 0.25, 1.0)
+        spread_to_mid = max(0.0, min(1.0, float(fv.spread) / max(0.02, implied * 0.08)))
+        spread_to_tte = max(
+            0.0,
+            min(1.0, float(fv.spread) / max(0.002, max(float(fv.time_to_expiry_hours), 0.01) * 0.08)),
+        )
+        log_volume_1h = max(0.0, min(1.0, math.log1p(max(0.0, float(fv.volume_1h))) / 12.0))
+        log_open_interest = max(0.0, min(1.0, math.log1p(max(0.0, float(fv.open_interest))) / 14.0))
+        volume_pressure = self._clip_symmetric((float(fv.volume_oi_ratio) - 0.15) / 0.25, 1.0)
+        imbalance = self._clip_symmetric(float(fv.orderbook_imbalance), 1.0)
+        momentum_abs = max(0.0, min(1.0, abs(float(fv.momentum_20)) / 0.03))
+        zscore_abs = max(0.0, min(1.0, abs(float(fv.zscore_20)) / 3.0))
+        vol_ratio_raw = float(fv.volatility_20) / max(float(fv.volatility_30), 1e-6)
+        vol_ratio_20_30 = self._clip_symmetric((vol_ratio_raw - 1.0) / 0.75, 1.0)
+        momentum_vol_adj = self._clip_symmetric(float(fv.momentum_20) / max(float(fv.volatility_30) * 3.0, 0.01), 1.0)
+        zscore_vol_adj = self._clip_symmetric((float(fv.zscore_20) / 3.0) * max(float(fv.volatility_30) / 0.04, 0.25), 1.0)
+        expiry_pressure = max(0.0, min(1.0, math.exp(-max(float(fv.time_to_expiry_hours), 0.0) / 0.20)))
+        tail_prob_flag = 1.0 if abs(implied - 0.5) >= 0.35 else 0.0
+        mid_prob_flag = 1.0 if abs(implied - 0.5) <= 0.08 else 0.0
+        imbalance_momentum_align = self._clip_symmetric(imbalance * math.tanh(float(fv.momentum_20) / 0.02), 1.0)
+        imbalance_zscore_align = self._clip_symmetric(imbalance * math.tanh(float(fv.zscore_20) / 2.5), 1.0)
+        revert_pressure = self._clip_symmetric(
+            (-math.tanh(float(fv.zscore_20) / 2.0)) * (1.0 - (0.5 * momentum_abs)),
+            1.0,
+        )
+        shock_flag = 1.0 if (float(fv.volatility_20) > float(fv.volatility_30) * 1.35) or (momentum_abs > 0.85) else 0.0
+
+        return {
+            "dist_from_mid": dist_from_mid,
+            "abs_dist_from_mid": abs(dist_from_mid),
+            "spread_to_mid": spread_to_mid,
+            "spread_to_tte": spread_to_tte,
+            "log_volume_1h": log_volume_1h,
+            "log_open_interest": log_open_interest,
+            "volume_pressure": volume_pressure,
+            "imbalance_abs": abs(imbalance),
+            "imbalance_momentum_align": imbalance_momentum_align,
+            "imbalance_zscore_align": imbalance_zscore_align,
+            "momentum_abs": momentum_abs,
+            "zscore_abs": zscore_abs,
+            "vol_ratio_20_30": vol_ratio_20_30,
+            "momentum_vol_adj": momentum_vol_adj,
+            "zscore_vol_adj": zscore_vol_adj,
+            "expiry_pressure": expiry_pressure,
+            "tail_prob_flag": tail_prob_flag,
+            "mid_prob_flag": mid_prob_flag,
+            "revert_pressure": revert_pressure,
+            "shock_flag": shock_flag,
+        }
+
     def regime_score(self, fv: FeatureVector) -> float:
         vol_factor = min(1.0, fv.volatility_30 / 0.10)
         expiry_factor = min(1.0, fv.time_to_expiry_hours / 168.0)
+        trend_factor = 0.55 + (0.45 * abs(self._trend_bias(fv)))
         stable = max(0.0, 1.0 - 0.7 * vol_factor + 0.3 * expiry_factor)
-        return max(0.0, min(25.0, 25.0 * stable))
+        return max(0.0, min(25.0, 25.0 * stable * trend_factor))
 
     async def _ensure_training_data(self, target: str) -> int:
         file_path = self._training_file_for_target(target)
@@ -365,14 +530,19 @@ class ModelEngine:
         return float(max(0.001, min(0.999, calibrated))), float(max(0.05, min(0.99, confidence)))
 
     def _heuristic_intraday_probability(self, fv: FeatureVector) -> float:
-        edge_hint = 0.45 * fv.orderbook_imbalance - 0.15 * fv.volatility_30
-        fair = fv.implied_prob + edge_hint
+        trend_bias = self._trend_bias(fv)
+        trend_strength = self._trend_strength(fv)
+        liquidity_scale = 0.50 + min(0.50, float(fv.volume_1h) / max(1.0, float(fv.open_interest) + 1.0))
+        expiry_scale = max(0.40, min(1.0, 1.0 - (float(fv.time_to_expiry_hours) / 24.0)))
+        shift = trend_bias * 0.12 * liquidity_scale * expiry_scale
+        fair = fv.implied_prob + shift + (trend_bias * trend_strength * 0.02)
         return max(0.001, min(0.999, fair))
 
     def _heuristic_settlement_probability(self, fv: FeatureVector) -> float:
-        trend_hint = 0.10 * fv.orderbook_imbalance
-        vol_dampen = max(0.4, 1.0 - min(1.0, fv.volatility_30 / 0.05))
-        fair = fv.implied_prob + (trend_hint * vol_dampen)
+        trend_bias = self._trend_bias(fv)
+        trend_strength = self._trend_strength(fv)
+        vol_dampen = max(0.45, 1.0 - min(1.0, fv.volatility_30 / 0.07))
+        fair = fv.implied_prob + (trend_bias * 0.07 * vol_dampen) + (trend_bias * trend_strength * 0.015)
         return max(0.001, min(0.999, fair))
 
     @staticmethod
@@ -393,10 +563,39 @@ class ModelEngine:
         norm = max(0.10, max(baseline, 1.0 - baseline))
         directional = max(-1.0, min(1.0, centered / norm))
         liquidity_scale = min(1.0, 0.4 + (fv.volume_1h / max(1.0, fv.open_interest + 1.0)))
-        vol_penalty = max(0.4, 1.0 - min(1.0, fv.volatility_30 / 0.05))
-        max_shift = 0.06
+        vol_penalty = max(0.5, 1.0 - min(1.0, fv.volatility_30 / 0.06))
+        max_shift = 0.09
         shift = directional * max_shift * liquidity_scale * vol_penalty
         return max(0.001, min(0.999, fv.implied_prob + shift))
+
+    def _trend_bias(self, fv: FeatureVector) -> float:
+        vol_20 = max(0.001, float(fv.volatility_20))
+        vol_30 = max(0.001, float(fv.volatility_30))
+        momentum = math.tanh(float(fv.momentum_20) / max(0.0025, vol_20 * 1.8))
+        imbalance = math.tanh(max(-1.0, min(1.0, float(fv.orderbook_imbalance))) * 1.3)
+        zscore = math.tanh(float(fv.zscore_20) / 2.5)
+        acceleration = math.tanh((float(fv.momentum_20) - (float(fv.zscore_20) * 0.01)) / max(0.003, vol_30 * 2.2))
+        raw = (0.48 * momentum) + (0.26 * imbalance) + (0.16 * zscore) + (0.10 * acceleration)
+        return max(-1.0, min(1.0, raw))
+
+    def _trend_strength(self, fv: FeatureVector) -> float:
+        bias = abs(self._trend_bias(fv))
+        liquidity = min(1.0, float(fv.volume_1h) / max(1.0, float(fv.open_interest) + 1.0))
+        expiry_scale = max(0.35, min(1.0, 1.0 - (float(fv.time_to_expiry_hours) / 24.0)))
+        return max(0.0, min(1.0, (0.60 * bias) + (0.20 * liquidity) + (0.20 * expiry_scale)))
+
+    @staticmethod
+    def _blend_probability(base: float, anchor: float, weight: float) -> float:
+        w = max(0.0, min(1.0, weight))
+        return (base * (1.0 - w)) + (anchor * w)
+
+    def _trend_anchor_probability(self, fv: FeatureVector, trend_bias: float, trend_strength: float) -> float:
+        liquidity_scale = 0.45 + min(0.55, float(fv.volume_1h) / max(1.0, float(fv.open_interest) + 1.0))
+        expiry_scale = max(0.35, min(1.0, 1.0 - (float(fv.time_to_expiry_hours) / 18.0)))
+        vol_scale = max(0.40, 1.0 - min(1.0, float(fv.volatility_30) / 0.12))
+        max_shift = 0.11 * liquidity_scale * expiry_scale * vol_scale
+        anchor = float(fv.implied_prob) + (trend_bias * max_shift) + (trend_bias * trend_strength * 0.025)
+        return max(0.001, min(0.999, anchor))
 
     def _training_file_for_target(self, target: str) -> Path:
         if target == "settlement":
@@ -464,7 +663,7 @@ class ModelEngine:
         if not rows_X:
             empty = np.empty((0,), dtype=np.float64)
             return (
-                np.empty((0, len(cls.FEATURE_COLUMNS)), dtype=np.float64),
+                np.empty((0, len(self.FEATURE_COLUMNS)), dtype=np.float64),
                 empty,
                 empty,
                 empty,
@@ -525,6 +724,10 @@ class ModelEngine:
         if limit <= 0:
             return value
         return max(-limit, min(limit, value))
+
+    @staticmethod
+    def _clip_probability(value: float) -> float:
+        return float(max(0.001, min(0.999, value)))
 
     def _build_walk_forward_folds(self, timestamps: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
         if timestamps.size == 0:

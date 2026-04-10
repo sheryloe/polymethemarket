@@ -1,3 +1,4 @@
+﻿
 from __future__ import annotations
 
 import asyncio
@@ -6,12 +7,7 @@ import os
 from dataclasses import dataclass
 from datetime import timezone
 
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.filters.command import CommandObject
-from aiogram.types import Message
+import httpx
 
 from polymethemoney.config import Settings
 from polymethemoney.domain import TradingMode
@@ -57,145 +53,195 @@ class TelegramBotService:
         self.gatekeeper = gatekeeper
         self.reporter = reporter
 
-        self.enabled = bool(self.settings.telegram_bot_token and self.settings.telegram_chat_id)
-        self.chat_id = int(self.settings.telegram_chat_id) if self.settings.telegram_chat_id else None
-        self.bot: Bot | None = None
-        self.dp: Dispatcher | None = None
-        self.instant_alerts_enabled = os.getenv("TELEGRAM_INSTANT_ALERTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-        if self.enabled:
-            self.bot = Bot(
-                token=self.settings.telegram_bot_token,
-                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-            )
-            self.dp = Dispatcher()
-            self._register_handlers()
+        self._token = (self.settings.telegram_bot_token or "").strip()
+        self._chat_id = int(self.settings.telegram_chat_id) if self.settings.telegram_chat_id else None
+        self._base_url = f"https://api.telegram.org/bot{self._token}" if self._token else ""
+        self._last_update_id = 0
+        self._client: httpx.AsyncClient | None = None
+        self._poll_timeout = 20
+        self.enabled = bool(self._token and self._chat_id)
+        self.instant_alerts_enabled = (
+            os.getenv("TELEGRAM_INSTANT_ALERTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+        )
+
+        self._handlers: dict[str, callable] = {
+            "help": self._cmd_help,
+            "start": self._cmd_help,
+            "status": self._cmd_status,
+            "report60": self._cmd_report60,
+            "report6h": self._cmd_report6h,
+            "positions": self._cmd_positions,
+            "pending": self._cmd_pending,
+            "pnl": self._cmd_pnl,
+            "risk": self._cmd_risk,
+            "gate": self._cmd_gate,
+            "data": self._cmd_data,
+            "config": self._cmd_config,
+            "pause": self._cmd_pause,
+            "resume": self._cmd_resume,
+            "go_live": self._cmd_go_live,
+            "go_paper": self._cmd_go_paper,
+            "set_minpos": self._cmd_set_minpos,
+            "clear_minpos": self._cmd_clear_minpos,
+            "reset_paper": self._cmd_reset_paper,
+            "approve": self._cmd_approve,
+            "reject": self._cmd_reject,
+            "reject_all": self._cmd_reject_all,
+            "close": self._cmd_close,
+            "close_market": self._cmd_close_market,
+            "close_side": self._cmd_close_side,
+            "closeall": self._cmd_closeall,
+            "panic": self._cmd_panic,
+        }
 
     async def run(self) -> None:
-        if not self.enabled or self.bot is None or self.dp is None:
+        if not self.enabled:
             logger.warning("Telegram disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
             while True:
                 await asyncio.sleep(3600)
-        await self.dp.start_polling(self.bot)
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        while True:
+            try:
+                await self._poll_once()
+            except Exception:
+                logger.exception("telegram poll failed")
+                await asyncio.sleep(2)
 
     async def notify(self, text: str) -> None:
-        if not self.enabled or self.bot is None or self.chat_id is None:
+        if not self.enabled or self._chat_id is None:
             logger.info("notify skipped: %s", text)
             return
         if not self.instant_alerts_enabled and not self._is_periodic_report(text):
             return
-        await self.bot.send_message(chat_id=self.chat_id, text=text)
+        await self._send_text(self._chat_id, text)
+
+    async def _poll_once(self) -> None:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        params = {
+            "timeout": self._poll_timeout,
+            "allowed_updates": "message",
+        }
+        if self._last_update_id:
+            params["offset"] = self._last_update_id + 1
+        resp = await self._client.get(f"{self._base_url}/getUpdates", params=params)
+        payload = resp.json()
+        if not payload.get("ok"):
+            return
+        for update in payload.get("result", []):
+            update_id = int(update.get("update_id", 0))
+            if update_id > self._last_update_id:
+                self._last_update_id = update_id
+            message = update.get("message")
+            if not isinstance(message, dict):
+                continue
+            await self._handle_message(message)
+
+    async def _handle_message(self, message: dict) -> None:
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if self._chat_id is None or chat_id != self._chat_id:
+            return
+        text = (message.get("text") or "").strip()
+        if not text or not text.startswith("/"):
+            return
+        command, args = self._parse_command(text)
+        handler = self._handlers.get(command)
+        if handler is None:
+            await self._send_text(chat_id, "[알림]\n알 수 없는 명령입니다. /help 를 확인해 주세요.")
+            return
+        await handler(chat_id, args)
+
+    async def _send_text(self, chat_id: int, text: str) -> None:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        try:
+            await self._client.post(
+                f"{self._base_url}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+            )
+        except Exception:
+            logger.exception("telegram send failed")
+
+    @staticmethod
+    def _parse_command(text: str) -> tuple[str, str]:
+        parts = text.split()
+        cmd = parts[0].split("@", 1)[0].lstrip("/")
+        args = " ".join(parts[1:]) if len(parts) > 1 else ""
+        return cmd, args
 
     @staticmethod
     def _is_periodic_report(text: str) -> bool:
         if not text:
             return False
         prefixes = (
-            "[정기 리포트]",
-            "[60분 실측 리포트]",
-            "[6시간 리포트]",
+            "[10분 누적]",
+            "[60분 누적]",
+            "[6시간 누적]",
             "[상태 요약]",
         )
         return text.startswith(prefixes)
 
-    def _register_handlers(self) -> None:
-        assert self.dp is not None
-        self.dp.message.register(self._cmd_help, Command("help"))
-
-        self.dp.message.register(self._cmd_status, Command("status"))
-        self.dp.message.register(self._cmd_report60, Command("report60"))
-        self.dp.message.register(self._cmd_report6h, Command("report6h"))
-        self.dp.message.register(self._cmd_positions, Command("positions"))
-        self.dp.message.register(self._cmd_pending, Command("pending"))
-        self.dp.message.register(self._cmd_pnl, Command("pnl"))
-        self.dp.message.register(self._cmd_risk, Command("risk"))
-        self.dp.message.register(self._cmd_gate, Command("gate"))
-        self.dp.message.register(self._cmd_data, Command("data"))
-
-        self.dp.message.register(self._cmd_pause, Command("pause"))
-        self.dp.message.register(self._cmd_resume, Command("resume"))
-        self.dp.message.register(self._cmd_kill_on, Command("kill_on"))
-        self.dp.message.register(self._cmd_kill_off, Command("kill_off"))
-        self.dp.message.register(self._cmd_go_live, Command("go_live"))
-        self.dp.message.register(self._cmd_go_paper, Command("go_paper"))
-        self.dp.message.register(self._cmd_set_minpos, Command("set_minpos"))
-        self.dp.message.register(self._cmd_clear_minpos, Command("clear_minpos"))
-
-        self.dp.message.register(self._cmd_approve, Command("approve"))
-        self.dp.message.register(self._cmd_reject, Command("reject"))
-        self.dp.message.register(self._cmd_reject_all, Command("reject_all"))
-        self.dp.message.register(self._cmd_close, Command("close"))
-        self.dp.message.register(self._cmd_close_market, Command("close_market"))
-        self.dp.message.register(self._cmd_close_side, Command("close_side"))
-        self.dp.message.register(self._cmd_closeall, Command("closeall"))
-        self.dp.message.register(self._cmd_panic, Command("panic"))
-
-    def _authorized(self, message: Message) -> bool:
-        if self.chat_id is None:
-            return False
-        return message.chat.id == self.chat_id
-
-    async def _cmd_help(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        await message.answer(
-            "[명령어 가이드]\n"
+    async def _cmd_help(self, chat_id: int, args: str) -> None:
+        await self._send_text(
+            chat_id,
+            "[봇 도움말]\n"
+            "이 봇은 BTC 5분 Up/Down 페이퍼 운용을 텔레그램에서 제어합니다.\n\n"
             "모니터링\n"
-            "/status : 운영 핵심 요약(모드/포지션/손익/게이트)\n"
-            "/report60 : 최근 60분 실측(신호/체결/거절 사유)\n"
-            "/report6h : 최근 6시간 실측\n"
-            "/positions [개수] : 오픈 포지션 상세 조회(기본 10, 최대 40)\n"
+            "/status : 현재 상태 요약(모드/오픈 포지션/손익/리스크)\n"
+            "/report60 : 최근 60분 누적(신호/체결/거절 사유)\n"
+            "/report6h : 최근 6시간 누적\n"
+            "/positions [개수] : 오픈 포지션 상세(기본 10, 최대 40)\n"
             "/pending : 승인 대기 신호 목록\n"
-            "/pnl : 실현/미실현 손익 요약\n"
-            "/risk : 드로다운/킬스위치/손실한도\n"
-            "/gate : 히스토리+페이퍼 게이트 상세\n"
-            "/data : tick/feature/signal 최신 시각\n"
-            "제어\n"
-            "/pause : 신규 진입 일시정지\n"
-            "/resume : 일시정지 해제 + 킬스위치 해제\n"
-            "/kill_on : 킬스위치 즉시 ON\n"
-            "/kill_off : 킬스위치 OFF\n"
-            "/go_paper : PAPER 모드 강제 전환\n"
+            "/pnl : 오늘/이번주 실현 손익 요약\n"
+            "/risk : 리스크 상태(DD)\n"
+            "/gate : 게이트 통과 현황\n"
+            "/data : 데이터 신선도(최근 tick/feature/signal)\n"
+            "/config : 운영 설정 요약\n\n"
+            "운영 제어\n"
+            "/pause : 신규 진입 일시 중지\n"
+            "/resume : 재개\n"
+            "/go_paper : PAPER 모드로 강제 전환\n"
             "/go_live : 게이트 통과 시 LIVE 전환(하드락이면 차단)\n"
-            "/set_minpos <usd> : 런타임 최소 진입금액 override\n"
-            "/clear_minpos : 런타임 최소 진입금액 override 해제\n"
+            "/set_minpos <usd> : 최소 진입 금액 임시 override\n"
+            "/clear_minpos : 최소 진입 override 해제\n"
+            "/reset_paper : PAPER 포지션 모두 닫고 상태 초기화\n\n"
             "승인/거절\n"
-            "/approve <signal_id> : 반자동 신호 승인\n"
-            "/reject <signal_id> : 반자동 신호 거절\n"
-            "/reject_all : 승인 대기 전체 거절\n"
+            "/approve <signal_id> : 승인 대기 신호 승인\n"
+            "/reject <signal_id> : 승인 대기 신호 거절\n"
+            "/reject_all : 승인 대기 전체 거절\n\n"
             "강제 청산\n"
             "/close <position_id> : 특정 포지션 강제 청산\n"
-            "/close_market <market_id> : 해당 마켓 오픈 포지션 전부 청산\n"
-            "/close_side <YES|NO> [limit] : 방향 기준 부분/전체 청산\n"
-            "/closeall : 오픈 포지션 전체 강제 청산\n"
-            "/panic : 긴급정지(일시정지+킬스위치+대기거절+전체청산)"
+            "/close_market <market_id> : 특정 시장 전체 청산\n"
+            "/close_side <YES|NO> [limit] : 방향 기준 일부/전체 청산\n"
+            "/closeall : 오픈 포지션 전체 청산\n"
+            "/panic : 긴급 중지(일시중지+전량 청산)\n\n"
+            "예시\n"
+            "/positions 20\n"
+            "/close 123\n"
+            "/close_market 0x1234abcd\n"
+            "/close_side YES 5",
         )
 
-    async def _cmd_status(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        await message.answer(await self.reporter.build_status_text())
+    async def _cmd_status(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_status_text())
 
-    async def _cmd_report60(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        await message.answer(await self.reporter.build_report60_text())
+    async def _cmd_report60(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_report60_text())
 
-    async def _cmd_report6h(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        await message.answer(await self.reporter.build_report6h_text())
+    async def _cmd_report6h(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, await self.reporter.build_report6h_text())
 
-    async def _cmd_positions(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
-            return
-        limit = self._parse_positive_int(command.args, default=10, max_value=40)
+    async def _cmd_positions(self, chat_id: int, args: str) -> None:
+        limit = self._parse_positive_int(args, default=10, max_value=40)
         if limit is None:
-            await message.answer("[사용법]\n/positions [개수]\n예: /positions 20")
+            await self._send_text(chat_id, "[사용법]\n/positions [개수]\n예: /positions 20")
             return
 
         views, unrealized_total = await self._build_position_views(limit=limit)
         if not views:
-            await message.answer("[포지션]\n현재 오픈 포지션이 없습니다.")
+            await self._send_text(chat_id, "[포지션]\n현재 오픈된 포지션이 없습니다.")
             return
 
         pos_plus = sum(1 for v in views if v.unrealized_pnl_usd > 1e-6)
@@ -212,14 +258,12 @@ class TelegramBotService:
                 f"({view.entry_price:.4f} -> {view.mark_price:.4f}, {view.unrealized_pnl_usd:+.2f})\n"
                 f"   {view.market_id} | {short_q}"
             )
-        await message.answer("\n".join(lines))
+        await self._send_text(chat_id, "\n".join(lines))
 
-    async def _cmd_pending(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_pending(self, chat_id: int, args: str) -> None:
         items = list(self.runtime_state.pending_approvals.items())
         if not items:
-            await message.answer("[승인 대기]\n현재 대기 신호가 없습니다.")
+            await self._send_text(chat_id, "[승인 대기]\n현재 대기 중인 신호가 없습니다.")
             return
         lines = [f"[승인 대기] 총 {len(items)}건"]
         for idx, (signal_id, intent) in enumerate(items[:20], start=1):
@@ -229,90 +273,77 @@ class TelegramBotService:
             )
         if len(items) > 20:
             lines.append(f"... 외 {len(items) - 20}건")
-        await message.answer("\n".join(lines))
+        await self._send_text(chat_id, "\n".join(lines))
 
-    async def _cmd_pnl(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_pnl(self, chat_id: int, args: str) -> None:
         snapshot = await self.store.status_snapshot()
         _, unrealized_total = await self._build_position_views(limit=10_000)
         est_total = float(snapshot["week_pnl"]) + unrealized_total
-        await message.answer(
+        await self._send_text(
+            chat_id,
             "[손익 요약]\n"
-            f"일간 실현손익 {snapshot['day_pnl']:+.2f} USD\n"
-            f"주간 실현손익 {snapshot['week_pnl']:+.2f} USD\n"
-            f"현재 미실현손익 {unrealized_total:+.2f} USD\n"
-            f"주간실현+미실현 {est_total:+.2f} USD\n"
-            f"오픈 포지션 {snapshot['open_positions']}개"
+            f"일간 실현 손익 {snapshot['day_pnl']:+.2f} USD\n"
+            f"주간 실현 손익 {snapshot['week_pnl']:+.2f} USD\n"
+            f"현재 미실현 손익 {unrealized_total:+.2f} USD\n"
+            f"주간 실현+미실현 {est_total:+.2f} USD\n"
+            f"오픈 포지션 {snapshot['open_positions']}개",
         )
 
-    async def _cmd_risk(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_risk(self, chat_id: int, args: str) -> None:
         state = await self.risk_engine.refresh_state()
         pause_text = "ON" if self.runtime_state.paused else "OFF"
-        kill_text = "ON" if self.runtime_state.kill_switch else "OFF"
-        await message.answer(
+        await self._send_text(
+            chat_id,
             "[리스크 상태]\n"
-            f"일시정지 {pause_text} | 킬스위치 {kill_text}\n"
+            f"일시중지 {pause_text}\n"
             f"일간 DD {state.daily_drawdown_pct:.2%}\n"
             f"주간 DD {state.weekly_drawdown_pct:.2%}\n"
-            f"손실한도(일/주) {self.settings.daily_loss_limit_pct:.2%} / {self.settings.weekly_loss_limit_pct:.2%}"
+            f"한도(일/주) {self.settings.daily_loss_limit_pct:.2%} / {self.settings.weekly_loss_limit_pct:.2%}",
         )
 
-    async def _cmd_gate(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        await message.answer(f"[게이트]\n{await self.gatekeeper.summary_text()}")
+    async def _cmd_gate(self, chat_id: int, args: str) -> None:
+        await self._send_text(chat_id, f"[게이트]\n{await self.gatekeeper.summary_text()}")
 
-    async def _cmd_data(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_data(self, chat_id: int, args: str) -> None:
         snapshot = await self.store.data_freshness_snapshot()
         latest_tick = self._fmt_ts(snapshot.get("latest_tick_ts"))
         latest_feature = self._fmt_ts(snapshot.get("latest_feature_ts"))
         latest_signal = self._fmt_ts(snapshot.get("latest_signal_ts"))
         ticks_5m = int(snapshot.get("ticks_5m") or 0)
-        await message.answer(
+        await self._send_text(
+            chat_id,
             "[데이터 신선도]\n"
             f"최근 tick {latest_tick}\n"
             f"최근 feature {latest_feature}\n"
             f"최근 signal {latest_signal}\n"
-            f"최근 5분 tick 수 {ticks_5m}건"
+            f"최근 5분 tick 수 {ticks_5m}건",
         )
 
-    async def _cmd_pause(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_config(self, chat_id: int, args: str) -> None:
+        mode = self.runtime_state.trading_mode.value.upper()
+        await self._send_text(
+            chat_id,
+            "[운영 설정]\n"
+            f"모드 {mode} | DEMO_PAPER_HARDLOCK {self.settings.demo_paper_hardlock}\n"
+            f"슬러그 프리픽스 {self.settings.contrarian_market_slug_prefix}\n"
+            f"진입 간격 {self.settings.contrarian_entry_interval_seconds}s | 금액 {self.settings.contrarian_position_usd:.2f} USD\n"
+            f"최대 포지션 {self.settings.contrarian_max_positions} | 만기 그레이스 {self.settings.contrarian_expiry_grace_seconds}s\n"
+            f"리포트 주기 {self.settings.report_interval_minutes}분 | 시드 {self.settings.starting_capital_usd:.2f} USD",
+        )
+
+    async def _cmd_pause(self, chat_id: int, args: str) -> None:
         self.runtime_state.paused = True
-        await message.answer("[제어]\n트레이딩을 일시정지했습니다.")
+        await self._send_text(chat_id, "[운영 제어]\n신규 진입을 일시 중지했습니다.")
 
-    async def _cmd_resume(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_resume(self, chat_id: int, args: str) -> None:
         self.runtime_state.paused = False
-        self.runtime_state.kill_switch = False
-        await message.answer("[제어]\n트레이딩을 재개했습니다. 킬스위치도 해제했습니다.")
+        await self._send_text(chat_id, "[운영 제어]\n거래를 재개했습니다.")
 
-    async def _cmd_kill_on(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        await self.risk_engine.activate_kill_switch("manual_command:/kill_on")
-        await message.answer("[긴급 제어]\n킬스위치 ON, 신규 진입 차단.")
-
-    async def _cmd_kill_off(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
-        self.runtime_state.kill_switch = False
-        await message.answer("[긴급 제어]\n킬스위치 OFF.")
-
-    async def _cmd_go_live(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_go_live(self, chat_id: int, args: str) -> None:
         if self.settings.demo_paper_hardlock:
             self.runtime_state.trading_mode = TradingMode.PAPER
             self.runtime_state.manual_live_approved = False
-            await message.answer("[실거래 전환 불가]\n데모 모드에서는 실거래 전환 불가")
+            await self._send_text(chat_id, "[모드 전환 불가]\nDEMO_PAPER_HARDLOCK이 켜져 있어 LIVE로 전환할 수 없습니다.")
             return
 
         hist_ok = await self.gatekeeper.historical_gate_passed()
@@ -320,144 +351,157 @@ class TelegramBotService:
         if not (hist_ok and paper_ok):
             reasons: list[str] = []
             if not hist_ok:
-                reasons.append("히스토리 60일 검증 미통과")
+                reasons.append("히스토리 게이트 미통과")
             if not paper_ok:
-                reasons.append("Paper 3일 실검증 미통과")
+                reasons.append("페이퍼 게이트 미통과")
             reason_text = "\n".join(f"- {reason}" for reason in reasons)
-            await message.answer(
-                "[실거래 전환 불가]\n"
+            await self._send_text(
+                chat_id,
+                "[모드 전환 불가]\n"
                 f"{reason_text}\n"
-                f"{await self.gatekeeper.summary_text()}"
+                f"{await self.gatekeeper.summary_text()}",
             )
             return
 
         self.runtime_state.trading_mode = TradingMode.LIVE
         self.runtime_state.manual_live_approved = True
-        await message.answer("[모드 전환]\nLIVE 모드로 전환했습니다.")
+        await self._send_text(chat_id, "[모드 전환]\nLIVE 모드로 전환했습니다.")
 
-    async def _cmd_go_paper(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_go_paper(self, chat_id: int, args: str) -> None:
         self.runtime_state.trading_mode = TradingMode.PAPER
         self.runtime_state.manual_live_approved = False
-        await message.answer("[모드 전환]\nPAPER 모드로 전환했습니다.")
+        await self._send_text(chat_id, "[모드 전환]\nPAPER 모드로 전환했습니다.")
 
-    async def _cmd_set_minpos(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
+    async def _cmd_set_minpos(self, chat_id: int, args: str) -> None:
+        if not args:
+            await self._send_text(chat_id, "[사용법]\n/set_minpos <usd>\n예: /set_minpos 1.5")
             return
-        if not command.args:
-            await message.answer("[사용법]\n/set_minpos <usd>\n예: /set_minpos 1.5")
-            return
-        value = self._parse_positive_float(command.args)
+        value = self._parse_positive_float(args)
         if value is None:
-            await message.answer("[실패]\n숫자를 입력하세요. 예: /set_minpos 1.5")
+            await self._send_text(chat_id, "[실패]\n숫자를 입력해 주세요. 예: /set_minpos 1.5")
             return
         if value > float(self.settings.max_position_usd):
-            await message.answer(
-                f"[실패]\n최소진입은 MAX_POSITION_USD({self.settings.max_position_usd:.2f})를 넘을 수 없습니다."
+            await self._send_text(
+                chat_id,
+                f"[실패]\n입력 값이 MAX_POSITION_USD({self.settings.max_position_usd:.2f})를 초과합니다.",
             )
             return
         self.runtime_state.min_position_usd_override = float(value)
-        await message.answer(
-            "[사이징]\n"
-            f"런타임 최소진입금액 override 적용: {self.runtime_state.min_position_usd_override:.2f} USD"
+        await self._send_text(
+            chat_id,
+            "[설정 변경]\n"
+            f"최소 진입 금액 override 적용: {self.runtime_state.min_position_usd_override:.2f} USD",
         )
 
-    async def _cmd_clear_minpos(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_clear_minpos(self, chat_id: int, args: str) -> None:
         self.runtime_state.min_position_usd_override = None
-        await message.answer("[사이징]\n런타임 최소진입금액 override 해제.")
+        await self._send_text(chat_id, "[설정 변경]\n최소 진입 금액 override를 해제했습니다.")
 
-    async def _cmd_approve(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
-            return
-        signal_id = (command.args or "").strip()
+    async def _cmd_reset_paper(self, chat_id: int, args: str) -> None:
+        reset = await self.store.reset_paper_open_positions()
+        self.runtime_state.pending_approvals.clear()
+        self.runtime_state.recent_signals.clear()
+        self.runtime_state.recent_signal_candidate_sides.clear()
+        self.runtime_state.recent_signal_candidate_rejects.clear()
+        self.runtime_state.recent_approved_signal_sides.clear()
+        self.runtime_state.recent_no_guard_rejects.clear()
+        self.runtime_state.min_position_usd_override = None
+        self.runtime_state.auto_tune_zero_fill_applied = False
+        self.runtime_state.auto_tune_zero_fill_applied_at = None
+        self.runtime_state.auto_tune_zero_fill_last_outcome = None
+        self.runtime_state.auto_tune_zero_fill_last_checked_at = None
+        self.runtime_state.paused = False
+        self.runtime_state.manual_live_approved = False
+
+        if hasattr(self.gatekeeper, "_local_trades"):
+            self.gatekeeper._local_trades.clear()
+        if hasattr(self.gatekeeper, "_local_violations"):
+            self.gatekeeper._local_violations.clear()
+
+        await self.risk_engine.refresh_state()
+        await self._send_text(
+            chat_id,
+            "[초기화 완료]\n"
+            "PAPER 오픈 포지션을 모두 닫고 상태를 초기화했습니다.\n"
+            f"닫은 포지션 {reset['positions_closed']}건, 구조물 레그 {reset['structure_legs_closed']}건.\n"
+            "주의: DB 히스토리는 유지됩니다. 완전 초기화는 컨테이너 DB 리셋이 필요합니다.",
+        )
+
+    async def _cmd_approve(self, chat_id: int, args: str) -> None:
+        signal_id = (args or "").strip()
         if not signal_id:
-            await message.answer("[사용법]\n/approve <signal_id>")
+            await self._send_text(chat_id, "[사용법]\n/approve <signal_id>")
             return
-        await message.answer(await self.execution_engine.approve_signal(signal_id))
+        await self._send_text(chat_id, await self.execution_engine.approve_signal(signal_id))
 
-    async def _cmd_reject(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
-            return
-        signal_id = (command.args or "").strip()
+    async def _cmd_reject(self, chat_id: int, args: str) -> None:
+        signal_id = (args or "").strip()
         if not signal_id:
-            await message.answer("[사용법]\n/reject <signal_id>")
+            await self._send_text(chat_id, "[사용법]\n/reject <signal_id>")
             return
-        await message.answer(await self.execution_engine.reject_signal(signal_id))
+        await self._send_text(chat_id, await self.execution_engine.reject_signal(signal_id))
 
-    async def _cmd_reject_all(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_reject_all(self, chat_id: int, args: str) -> None:
         count = await self.execution_engine.reject_all_pending()
-        await message.answer(f"[승인 대기 정리]\n일괄 거절 {count}건 완료.")
+        await self._send_text(chat_id, f"[승인 대기 정리]\n대기 신호 {count}건을 모두 거절했습니다.")
 
-    async def _cmd_close(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
-            return
-        position_id = self._parse_positive_int(command.args, default=None, max_value=10_000_000)
+    async def _cmd_close(self, chat_id: int, args: str) -> None:
+        position_id = self._parse_positive_int(args, default=None, max_value=10_000_000)
         if position_id is None:
-            await message.answer("[사용법]\n/close <position_id>\n예: /close 123")
+            await self._send_text(chat_id, "[사용법]\n/close <position_id>\n예: /close 123")
             return
         result = await self.execution_engine.force_close_position(position_id)
-        await message.answer(self._render_close_result("포지션 강제청산", result))
+        await self._send_text(chat_id, self._render_close_result("포지션 강제 청산", result))
 
-    async def _cmd_close_market(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
-            return
-        market_id = (command.args or "").strip()
+    async def _cmd_close_market(self, chat_id: int, args: str) -> None:
+        market_id = (args or "").strip()
         if not market_id:
-            await message.answer("[사용법]\n/close_market <market_id>")
+            await self._send_text(chat_id, "[사용법]\n/close_market <market_id>")
             return
         result = await self.execution_engine.force_close_market(market_id)
-        await message.answer(self._render_close_result(f"마켓 강제청산 ({market_id})", result))
+        await self._send_text(chat_id, self._render_close_result(f"시장 강제 청산 ({market_id})", result))
 
-    async def _cmd_close_side(self, message: Message, command: CommandObject) -> None:
-        if not self._authorized(message):
+    async def _cmd_close_side(self, chat_id: int, args: str) -> None:
+        raw = (args or "").strip()
+        if not raw:
+            await self._send_text(chat_id, "[사용법]\n/close_side <YES|NO> [limit]\n예: /close_side YES 5")
             return
-        args = (command.args or "").strip().split()
-        if not args:
-            await message.answer("[사용법]\n/close_side <YES|NO> [limit]\n예: /close_side YES 5")
-            return
-        side = args[0].upper()
+        parts = raw.split()
+        side = parts[0].upper()
         if side not in {"YES", "NO"}:
-            await message.answer("[실패]\nside는 YES 또는 NO만 가능합니다.")
+            await self._send_text(chat_id, "[실패]\nside는 YES 또는 NO만 가능합니다.")
             return
         limit = None
-        if len(args) >= 2:
-            parsed = self._parse_positive_int(args[1], default=None, max_value=10_000)
+        if len(parts) >= 2:
+            parsed = self._parse_positive_int(parts[1], default=None, max_value=10_000)
             if parsed is None:
-                await message.answer("[실패]\nlimit는 양의 정수여야 합니다.")
+                await self._send_text(chat_id, "[실패]\nlimit은 양의 정수여야 합니다.")
                 return
             limit = parsed
         result = await self.execution_engine.force_close_side(side, limit=limit)
-        label = f"사이드 강제청산 ({side}" + ("" if limit is None else f", limit={limit}") + ")"
-        await message.answer(self._render_close_result(label, result))
+        label = f"방향 강제 청산 ({side}" + ("" if limit is None else f", limit={limit}") + ")"
+        await self._send_text(chat_id, self._render_close_result(label, result))
 
-    async def _cmd_closeall(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_closeall(self, chat_id: int, args: str) -> None:
         mode = TradingMode.PAPER if self.settings.demo_paper_hardlock else self.runtime_state.trading_mode
         rows = await self.store.get_open_positions(mode)
         result = await self.execution_engine.force_close_positions(
             [int(row.id) for row in rows],
             reason="manual_close_all",
         )
-        await message.answer(self._render_close_result("전체 강제청산", result))
+        await self._send_text(chat_id, self._render_close_result("전체 강제 청산", result))
 
-    async def _cmd_panic(self, message: Message) -> None:
-        if not self._authorized(message):
-            return
+    async def _cmd_panic(self, chat_id: int, args: str) -> None:
         result = await self.execution_engine.emergency_stop(flatten=True)
         flat = result.get("flatten", {})
-        await message.answer(
-            "[긴급정지]\n"
-            f"paused={result.get('paused')} | kill_switch={result.get('kill_switch')}\n"
-            f"대기신호 거절 {result.get('rejected_pending')}건\n"
+        await self._send_text(
+            chat_id,
+            "[긴급 중지]\n"
+            f"paused={result.get('paused')}\n"
+            f"승인 대기 거절 {result.get('rejected_pending')}건\n"
             f"청산 요청 {flat.get('requested', 0)} | 청산 {flat.get('closed', 0)} | "
             f"미존재 {flat.get('missing', 0)} | 가격없음 {flat.get('no_price', 0)}\n"
-            f"실현손익 {float(flat.get('realized_pnl_usd', 0.0)):+.2f} USD"
+            f"실현 손익 {float(flat.get('realized_pnl_usd', 0.0)):+.2f} USD",
         )
 
     async def _build_position_views(self, limit: int) -> tuple[list[PositionView], float]:
@@ -532,7 +576,7 @@ class TelegramBotService:
         if error:
             return (
                 f"[{title}]\n"
-                f"모드 {str(result.get('mode')).upper()} | 실패사유 {error}\n"
+                f"모드 {str(result.get('mode')).upper()} | 실패 사유 {error}\n"
                 f"요청 {result.get('requested', 0)} | 청산 {result.get('closed', 0)}"
             )
         return (
@@ -540,5 +584,5 @@ class TelegramBotService:
             f"모드 {str(result.get('mode')).upper()}\n"
             f"요청 {result.get('requested', 0)} | 청산 {result.get('closed', 0)} | "
             f"미존재 {result.get('missing', 0)} | 가격없음 {result.get('no_price', 0)}\n"
-            f"실현손익 {float(result.get('realized_pnl_usd', 0.0)):+.2f} USD"
+            f"실현 손익 {float(result.get('realized_pnl_usd', 0.0)):+.2f} USD"
         )

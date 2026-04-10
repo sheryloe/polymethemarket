@@ -7,7 +7,7 @@ import pytest
 
 from polymethemoney.adapters.paper_exchange import MarketQuote, PaperExchange
 from polymethemoney.config import Settings
-from polymethemoney.domain import DecisionType, OrderIntent, Side
+from polymethemoney.domain import DecisionType, OrderIntent, STRATEGY_LEGACY, Side
 
 
 @pytest.mark.asyncio
@@ -18,10 +18,12 @@ async def test_paper_exchange_rejects_when_no_venues_and_no_fallback() -> None:
         PAPER_EXCHANGE_VENUES="",
         PAPER_TICKER_SYMBOLS="",
         PAPER_FALLBACK_TO_POLYMARKET=False,
+        PAPER_POST_ONLY=False,
     )
     exchange = PaperExchange(settings=settings, taker_fee_bps=10.0)
     result = await exchange.place_limit_order(
         OrderIntent(
+            strategy_id=STRATEGY_LEGACY,
             signal_id="s1",
             market_id="m-empty",
             side=Side.YES,
@@ -41,6 +43,7 @@ async def test_paper_exchange_fills_yes_with_stubbed_symbol_quote() -> None:
         PAPER_EXCHANGE_VENUES="binance",
         PAPER_TICKER_SYMBOLS="BTCUSDT",
         PAPER_MARKET_SYMBOL_MAP='{"m1":"BTCUSDT"}',
+        PAPER_POST_ONLY=False,
     )
     exchange = PaperExchange(settings=settings, taker_fee_bps=10.0)
     quote = MarketQuote(
@@ -55,6 +58,7 @@ async def test_paper_exchange_fills_yes_with_stubbed_symbol_quote() -> None:
 
     result = await exchange.place_limit_order(
         OrderIntent(
+            strategy_id=STRATEGY_LEGACY,
             signal_id="s2",
             market_id="m1",
             side=Side.YES,
@@ -76,6 +80,7 @@ async def test_paper_exchange_uses_stable_hash_symbol_for_unmapped_market() -> N
         PAPER_EXCHANGE_VENUES="binance",
         PAPER_TICKER_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT",
         PAPER_MARKET_SYMBOL_MAP="{}",
+        PAPER_POST_ONLY=False,
     )
     exchange = PaperExchange(settings=settings, taker_fee_bps=10.0)
 
@@ -97,6 +102,7 @@ async def test_paper_exchange_uses_stable_hash_symbol_for_unmapped_market() -> N
     market_id = "market-foo"
     await exchange.place_limit_order(
         OrderIntent(
+            strategy_id=STRATEGY_LEGACY,
             signal_id="s3",
             market_id=market_id,
             side=Side.NO,

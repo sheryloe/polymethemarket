@@ -213,6 +213,7 @@ class PolymarketClient:
         status = str(payload.get("status", "filled"))
         return FillResult(
             order_id=str(payload.get("order_id", order_id)),
+            strategy_id=intent.strategy_id,
             market_id=intent.market_id,
             side=intent.side,
             fill_price=fill_price,

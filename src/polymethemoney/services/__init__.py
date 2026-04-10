@@ -26,6 +26,7 @@ if not any(isinstance(finder, _ServicePycFinder) for finder in sys.meta_path):
     sys.meta_path.insert(0, _ServicePycFinder())
 
 from .collector import CollectorService  # type: ignore  # noqa: E402
+from .contrarian_engine import ContrarianEngine  # type: ignore  # noqa: E402
 from .execution_engine import ExecutionEngine  # type: ignore  # noqa: E402
 from .feature_engine import FeatureEngine  # type: ignore  # noqa: E402
 from .gatekeeper import Gatekeeper  # type: ignore  # noqa: E402
@@ -38,6 +39,7 @@ from .telegram_bot import TelegramBotService  # noqa: E402
 
 __all__ = [
     "CollectorService",
+    "ContrarianEngine",
     "ExecutionEngine",
     "FeatureEngine",
     "Gatekeeper",
