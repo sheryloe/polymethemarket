@@ -67,7 +67,7 @@ class ExecutionEngine:
             if self._open_same_market_side_count(open_positions, signal) >= max_per_side:
                 await self.store.update_signal_status(signal.signal_id, "rejected:market_side_max_open")
                 return
-        structure_open = 0 if self.settings.ab_test_enabled else await self.store.structure_open_legs_count()
+        structure_open = 0 if self.settings.contrarian_enabled else await self.store.structure_open_legs_count()
         decision = await self.risk_engine.decide(signal, len(open_positions) + structure_open)
         if decision.kind == DecisionType.REJECT:
             await self.store.update_signal_status(signal.signal_id, f"rejected:{decision.reason}")
@@ -80,6 +80,7 @@ class ExecutionEngine:
             price=self._entry_limit_price(signal),
             size_usd=decision.size_usd,
             mode=decision.kind,
+            execution_mode=str(getattr(signal, "execution_mode", "legacy") or "legacy"),
         )
         if decision.kind == DecisionType.SEMI:
             self.runtime_state.pending_approvals[signal.signal_id] = intent
@@ -223,6 +224,7 @@ class ExecutionEngine:
                 position_id=int(row.id),
                 mark_price=mark_price,
                 mode=mode,
+                exit_fee_bps=float(self.settings.taker_fee_bps) if mode == TradingMode.PAPER else 0.0,
                 strategy_id=str(getattr(row, "strategy_id", "")) or None,
             )
             if closed is None:
@@ -235,10 +237,11 @@ class ExecutionEngine:
                 side=side,
                 fill_price=float(closed["exit_price"]),
                 size_usd=float(closed["size_usd"]),
-                fee_usd=0.0,
+                fee_usd=float(closed.get("exit_fee_usd", 0.0) or 0.0),
                 pnl_usd=realized,
                 trading_mode=mode,
                 strategy_id=str(closed.get("strategy_id") or ""),
+                execution_mode=str(closed.get("execution_mode") or "legacy"),
             )
             if mode == TradingMode.PAPER and realized != 0.0:
                 await self.gatekeeper.register_paper_trade(realized, when=now)
@@ -536,13 +539,14 @@ class ExecutionEngine:
     async def _apply_fill_to_positions(self, intent: OrderIntent, fill: FillResult) -> None:
         mode = fill.mode
         realized = 0.0
-        if not (self.settings.contrarian_enabled or self.settings.ab_test_enabled):
+        if not self.settings.contrarian_enabled:
             opposite = Side.NO.value if intent.side == Side.YES else Side.YES.value
             closed = await self.store.close_positions_for_market(
                 market_id=intent.market_id,
                 opposite_side=opposite,
                 exit_price=fill.fill_price,
                 mode=mode,
+                exit_fee_bps=float(self.settings.taker_fee_bps) if mode == TradingMode.PAPER else 0.0,
                 strategy_id=intent.strategy_id,
             )
             realized = sum(pnl for _, pnl in closed)
@@ -558,6 +562,7 @@ class ExecutionEngine:
             pnl_usd=realized,
             trading_mode=mode,
             strategy_id=intent.strategy_id,
+            execution_mode=intent.execution_mode,
         )
         await self.store.open_position(
             market_id=intent.market_id,
@@ -565,7 +570,9 @@ class ExecutionEngine:
             entry_price=fill.fill_price,
             size_usd=intent.size_usd,
             mode=mode,
+            entry_fee_usd=float(fill.fee_usd),
             strategy_id=intent.strategy_id,
+            execution_mode=intent.execution_mode,
         )
 
     def _entry_limit_price(self, signal: Signal) -> float:
@@ -636,6 +643,7 @@ class ExecutionEngine:
                 position_id=int(row.id),
                 mark_price=mark_price,
                 mode=mode,
+                exit_fee_bps=float(self.settings.taker_fee_bps) if mode == TradingMode.PAPER else 0.0,
                 strategy_id=signal.strategy_id,
             )
             if closed is None:
@@ -648,10 +656,11 @@ class ExecutionEngine:
                 side=side,
                 fill_price=float(closed["exit_price"]),
                 size_usd=float(closed["size_usd"]),
-                fee_usd=0.0,
+                fee_usd=float(closed.get("exit_fee_usd", 0.0) or 0.0),
                 pnl_usd=realized,
                 trading_mode=mode,
                 strategy_id=str(closed.get("strategy_id") or signal.strategy_id),
+                execution_mode=str(closed.get("execution_mode") or "legacy"),
             )
             if realized != 0.0:
                 await self.gatekeeper.register_paper_trade(realized, when=now)

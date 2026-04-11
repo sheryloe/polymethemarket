@@ -18,8 +18,10 @@ from sklearn.preprocessing import StandardScaler
 
 from polymethemoney.config import Settings
 from polymethemoney.domain import (
+    STRATEGY_EXPIRY_ANCHOR,
     STRATEGY_MODEL_A,
     STRATEGY_MODEL_B,
+    STRATEGY_TAPE_RIDER,
     DualModelScore,
     FeatureVector,
 )
@@ -206,9 +208,51 @@ class ModelEngine:
         return self.predict(fv).fair_probability
 
     def predict_strategy(self, strategy_id: str, fv: FeatureVector) -> ModelPrediction:
+        if strategy_id == STRATEGY_EXPIRY_ANCHOR:
+            return self.predict_expiry_anchor(fv)
+        if strategy_id == STRATEGY_TAPE_RIDER:
+            return self.predict_tape_rider(fv)
         if strategy_id == STRATEGY_MODEL_B:
             return self.predict_model_b(fv)
         return self.predict_model_a(fv)
+
+    def predict_expiry_anchor(self, fv: FeatureVector) -> ModelPrediction:
+        base = self.predict_dual_score(fv)
+        derived = self.derive_strategy_features(fv)
+        bias = 0.04 * math.tanh(
+            (1.4 * float(fv.orderbook_imbalance))
+            + (0.9 * float(fv.volume_oi_ratio))
+            - (0.7 * float(derived["spread_to_tte"]))
+            + (0.5 * float(derived["mid_prob_flag"]))
+        )
+        fair = self._clip_probability(
+            (0.65 * float(base.settlement_prob))
+            + (0.20 * float(base.intraday_prob))
+            + (0.15 * float(fv.implied_prob))
+            + bias
+        )
+        confidence = self._clip_probability(
+            (0.45 * float(base.confidence))
+            + 0.25
+            + (0.15 * (1.0 - float(derived["spread_to_tte"])))
+            + (0.15 * float(derived["mid_prob_flag"]))
+        )
+        return ModelPrediction(fair_probability=fair, confidence=confidence)
+
+    def predict_tape_rider(self, fv: FeatureVector) -> ModelPrediction:
+        derived = self.derive_strategy_features(fv)
+        bias = 0.12 * math.tanh(
+            (2.6 * float(derived["momentum_vol_adj"]))
+            + (1.4 * float(derived["imbalance_momentum_align"]))
+            + (0.9 * float(derived["vol_ratio_20_30"]))
+            + (0.6 * float(derived["volume_pressure"]))
+            - (0.7 * float(derived["spread_to_tte"]))
+        )
+        fair = self._clip_probability(float(fv.implied_prob) + bias)
+        shock_flag = float(derived["shock_flag"])
+        confidence = 0.20 + (0.35 * abs(bias) / 0.12) + (0.15 * abs(float(derived["imbalance_momentum_align"]))) + (0.10 * (1.0 - shock_flag))
+        confidence = float(max(0.05, min(0.99, confidence)))
+        return ModelPrediction(fair_probability=fair, confidence=confidence)
 
     def predict_model_a(self, fv: FeatureVector) -> ModelPrediction:
         base = self.predict_dual_score(fv)
@@ -363,6 +407,11 @@ class ModelEngine:
             if generated_rows > 0:
                 X, _, _, _ = self._load_training_data(file_path)
                 return int(X.shape[0])
+        if target == "settlement" and self.settings.auto_build_training_from_db:
+            generated_rows = await self._rebuild_settlement_from_resolved_features(file_path)
+            if generated_rows > 0:
+                X, _, _, _ = self._load_training_data(file_path)
+                return int(X.shape[0])
 
         # Legacy fallback for intraday only.
         if target == "intraday" and self.legacy_training_file.exists():
@@ -396,6 +445,33 @@ class ModelEngine:
             )
             if len(relaxed) > len(rows):
                 rows = self._rebalance_rows(relaxed, max_negative_multiplier=8.0)
+        if not rows:
+            return 0
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with file_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+        return len(rows)
+
+    async def _rebuild_settlement_from_resolved_features(self, file_path: Path) -> int:
+        rows = await self.store.build_training_rows_from_settlements(
+            lookback_days=self.settings.training_lookback_days,
+            max_spread_pct=self.settings.training_max_spread_pct,
+            min_volume_oi_ratio=self.settings.training_min_vol_oi_ratio,
+            min_tte_hours=self.settings.training_min_tte_hours,
+            max_sample_weight=self.settings.training_max_weight,
+        )
+        if len(rows) < self._min_rows_for_target("settlement"):
+            relaxed = await self.store.build_training_rows_from_settlements(
+                lookback_days=self.settings.training_lookback_days,
+                max_spread_pct=self.settings.training_max_spread_pct,
+                min_volume_oi_ratio=None,
+                min_tte_hours=None,
+                max_sample_weight=self.settings.training_max_weight,
+            )
+            if len(relaxed) > len(rows):
+                rows = relaxed
         if not rows:
             return 0
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -761,8 +837,10 @@ class ModelEngine:
         split_points = [0.70, 0.78, 0.86]
         for ratio in split_points:
             split = int(n_rows * ratio)
-            valid_end = min(n_rows, split + max(30, int(n_rows * 0.08)))
-            if split < 120 or valid_end - split < 30:
+            # Short-horizon BTC datasets are often compact; keep a slightly
+            # larger fallback validation window so OOF calibration can proceed.
+            valid_end = min(n_rows, split + max(40, int(n_rows * 0.10)))
+            if split < 120 or valid_end - split < 40:
                 continue
             train_idx = np.arange(0, split)
             valid_idx = np.arange(split, valid_end)

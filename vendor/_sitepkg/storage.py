@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, func, select, text, update
@@ -39,6 +40,60 @@ class Store:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], starting_capital_usd: float) -> None:
         self.session_factory = session_factory
         self.starting_capital_usd = starting_capital_usd
+
+    @staticmethod
+    def _clip_contract_price(price: float) -> float:
+        return max(0.001, min(0.999, float(price)))
+
+    @staticmethod
+    def estimate_position_unrealized(
+        *,
+        size_usd: float,
+        entry_price: float,
+        mark_price: float,
+        entry_fee_usd: float = 0.0,
+        exit_fee_bps: float = 0.0,
+    ) -> dict[str, float]:
+        clipped_entry = max(float(entry_price), 0.001)
+        shares = float(size_usd) / clipped_entry
+        clipped_mark = Store._clip_contract_price(mark_price)
+        exit_value = shares * clipped_mark
+        exit_fee_usd = max(0.0, exit_value * max(0.0, float(exit_fee_bps)) / 10000.0)
+        gross_unrealized = exit_value - float(size_usd)
+        net_unrealized = gross_unrealized - float(entry_fee_usd) - exit_fee_usd
+        return {
+            "shares": shares,
+            "mark_price": clipped_mark,
+            "exit_value": exit_value,
+            "entry_fee_usd": float(entry_fee_usd),
+            "exit_fee_usd": exit_fee_usd,
+            "gross_unrealized_pnl_usd": gross_unrealized,
+            "net_unrealized_pnl_usd": net_unrealized,
+        }
+
+    @staticmethod
+    def estimate_position_settlement(
+        *,
+        size_usd: float,
+        entry_price: float,
+        settled_price: float,
+        entry_fee_usd: float = 0.0,
+    ) -> dict[str, float]:
+        clipped_entry = max(float(entry_price), 0.001)
+        shares = float(size_usd) / clipped_entry
+        terminal_price = max(0.0, min(1.0, float(settled_price)))
+        exit_value = shares * terminal_price
+        gross_realized = exit_value - float(size_usd)
+        net_realized = gross_realized - float(entry_fee_usd)
+        return {
+            "shares": shares,
+            "settled_price": terminal_price,
+            "exit_value": exit_value,
+            "entry_fee_usd": float(entry_fee_usd),
+            "exit_fee_usd": 0.0,
+            "gross_realized_pnl_usd": gross_realized,
+            "net_realized_pnl_usd": net_realized,
+        }
 
     async def add_market_tick(self, tick: MarketTick) -> None:
         async with self.session_factory() as session:
@@ -82,6 +137,7 @@ class Store:
             row = SignalORM(
                 id=signal.signal_id,
                 strategy_id=signal.strategy_id,
+                execution_mode=str(getattr(signal, "execution_mode", STRATEGY_LEGACY) or STRATEGY_LEGACY),
                 market_id=signal.market_id,
                 created_at=signal.created_at,
                 side=signal.side.value,
@@ -114,6 +170,7 @@ class Store:
             row = OrderORM(
                 id=order_id,
                 strategy_id=intent.strategy_id,
+                execution_mode=str(getattr(intent, "execution_mode", STRATEGY_LEGACY) or STRATEGY_LEGACY),
                 signal_id=intent.signal_id,
                 market_id=intent.market_id,
                 side=intent.side.value,
@@ -150,10 +207,12 @@ class Store:
         pnl_usd: float,
         trading_mode: TradingMode,
         strategy_id: str = STRATEGY_LEGACY,
+        execution_mode: str = STRATEGY_LEGACY,
     ) -> None:
         async with self.session_factory() as session:
             fill = FillORM(
                 strategy_id=strategy_id,
+                execution_mode=execution_mode,
                 order_id=order_id,
                 market_id=market_id,
                 side=side,
@@ -174,18 +233,28 @@ class Store:
         entry_price: float,
         size_usd: float,
         mode: TradingMode,
+        entry_fee_usd: float = 0.0,
         strategy_id: str = STRATEGY_LEGACY,
+        execution_mode: str = STRATEGY_LEGACY,
     ) -> None:
         async with self.session_factory() as session:
             row = PositionORM(
                 strategy_id=strategy_id,
+                execution_mode=execution_mode,
                 market_id=market_id,
                 side=side,
                 entry_price=entry_price,
                 size_usd=size_usd,
+                entry_fee_usd=max(0.0, float(entry_fee_usd)),
+                exit_fee_usd=0.0,
                 trading_mode=mode.value,
                 status="open",
                 opened_at=datetime.now(timezone.utc),
+                gross_realized_pnl_usd=0.0,
+                realized_pnl_usd=0.0,
+                close_reason=None,
+                fallback_mark_close=False,
+                resolved_outcome_yes=None,
             )
             session.add(row)
             await session.commit()
@@ -194,6 +263,7 @@ class Store:
         self,
         trading_mode: TradingMode | None = None,
         strategy_id: str | None = None,
+        execution_mode: str | None = None,
     ) -> list[PositionORM]:
         async with self.session_factory() as session:
             stmt = select(PositionORM).where(PositionORM.status == "open")
@@ -201,6 +271,8 @@ class Store:
                 stmt = stmt.where(PositionORM.trading_mode == trading_mode.value)
             if strategy_id is not None:
                 stmt = stmt.where(PositionORM.strategy_id == strategy_id)
+            if execution_mode is not None:
+                stmt = stmt.where(PositionORM.execution_mode == execution_mode)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
@@ -210,6 +282,7 @@ class Store:
         opposite_side: str,
         exit_price: float,
         mode: TradingMode,
+        exit_fee_bps: float = 0.0,
         strategy_id: str | None = None,
     ) -> list[tuple[int, float]]:
         now = datetime.now(timezone.utc)
@@ -227,11 +300,19 @@ class Store:
                 stmt = stmt.where(PositionORM.strategy_id == strategy_id)
             rows = list((await session.execute(stmt)).scalars().all())
             for row in rows:
-                shares = row.size_usd / max(row.entry_price, 0.01)
-                exit_value = shares * exit_price
-                pnl = exit_value - row.size_usd
+                mtm = self.estimate_position_unrealized(
+                    size_usd=float(row.size_usd),
+                    entry_price=float(row.entry_price),
+                    mark_price=exit_price,
+                    entry_fee_usd=float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+                    exit_fee_bps=exit_fee_bps,
+                )
+                gross_pnl = float(mtm["gross_unrealized_pnl_usd"])
+                pnl = float(mtm["net_unrealized_pnl_usd"])
                 row.status = "closed"
                 row.closed_at = now
+                row.exit_fee_usd = float(mtm["exit_fee_usd"])
+                row.gross_realized_pnl_usd = gross_pnl
                 row.realized_pnl_usd = pnl
                 closed.append((row.id, pnl))
             await session.commit()
@@ -257,7 +338,13 @@ class Store:
             pos_stmt = update(PositionORM).where(and_(*filters)).values(
                 status="closed",
                 closed_at=now,
+                entry_fee_usd=0.0,
+                exit_fee_usd=0.0,
+                gross_realized_pnl_usd=0.0,
                 realized_pnl_usd=0.0,
+                close_reason="reset_paper",
+                fallback_mark_close=False,
+                resolved_outcome_yes=None,
             )
             pos_result = await session.execute(pos_stmt)
 
@@ -292,7 +379,10 @@ class Store:
         position_id: int,
         mark_price: float,
         mode: TradingMode,
+        exit_fee_bps: float = 0.0,
         strategy_id: str | None = None,
+        close_reason: str = "mark_close",
+        fallback_mark_close: bool = False,
     ) -> dict | None:
         now = datetime.now(timezone.utc)
         async with self.session_factory() as session:
@@ -307,22 +397,95 @@ class Store:
             row = (await session.execute(stmt)).scalar_one_or_none()
             if row is None:
                 return None
-            shares = float(row.size_usd) / max(float(row.entry_price), 0.001)
-            exit_value = shares * max(0.001, min(0.999, mark_price))
-            pnl = exit_value - float(row.size_usd)
+            mtm = self.estimate_position_unrealized(
+                size_usd=float(row.size_usd),
+                entry_price=float(row.entry_price),
+                mark_price=mark_price,
+                entry_fee_usd=float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+                exit_fee_bps=exit_fee_bps,
+            )
+            gross_pnl = float(mtm["gross_unrealized_pnl_usd"])
+            pnl = float(mtm["net_unrealized_pnl_usd"])
             row.status = "closed"
             row.closed_at = now
+            row.exit_fee_usd = float(mtm["exit_fee_usd"])
+            row.gross_realized_pnl_usd = gross_pnl
             row.realized_pnl_usd = pnl
+            row.close_reason = close_reason
+            row.fallback_mark_close = bool(fallback_mark_close)
+            row.resolved_outcome_yes = None
             await session.commit()
             return {
                 "position_id": int(row.id),
                 "strategy_id": str(row.strategy_id),
+                "execution_mode": str(getattr(row, "execution_mode", STRATEGY_LEGACY) or STRATEGY_LEGACY),
                 "market_id": str(row.market_id),
                 "side": str(row.side),
                 "size_usd": float(row.size_usd),
                 "entry_price": float(row.entry_price),
-                "exit_price": float(mark_price),
+                "entry_fee_usd": float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+                "exit_fee_usd": float(mtm["exit_fee_usd"]),
+                "gross_realized_pnl_usd": gross_pnl,
+                "exit_price": float(mtm["mark_price"]),
                 "realized_pnl_usd": float(pnl),
+                "close_reason": close_reason,
+                "fallback_mark_close": bool(fallback_mark_close),
+            }
+
+    async def close_position_at_settlement(
+        self,
+        position_id: int,
+        outcome_yes: float,
+        mode: TradingMode,
+        strategy_id: str | None = None,
+        close_reason: str = "resolved_outcome",
+    ) -> dict | None:
+        now = datetime.now(timezone.utc)
+        async with self.session_factory() as session:
+            filters = [
+                PositionORM.id == position_id,
+                PositionORM.status == "open",
+                PositionORM.trading_mode == mode.value,
+            ]
+            if strategy_id is not None:
+                filters.append(PositionORM.strategy_id == strategy_id)
+            stmt = select(PositionORM).where(and_(*filters))
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            terminal_yes = max(0.0, min(1.0, float(outcome_yes)))
+            settled_price = terminal_yes if str(row.side).upper() == "YES" else (1.0 - terminal_yes)
+            settlement = self.estimate_position_settlement(
+                size_usd=float(row.size_usd),
+                entry_price=float(row.entry_price),
+                settled_price=settled_price,
+                entry_fee_usd=float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+            )
+            row.status = "closed"
+            row.closed_at = now
+            row.exit_fee_usd = 0.0
+            row.gross_realized_pnl_usd = float(settlement["gross_realized_pnl_usd"])
+            row.realized_pnl_usd = float(settlement["net_realized_pnl_usd"])
+            row.close_reason = close_reason
+            row.fallback_mark_close = False
+            row.resolved_outcome_yes = terminal_yes
+            await session.commit()
+            return {
+                "position_id": int(row.id),
+                "strategy_id": str(row.strategy_id),
+                "execution_mode": str(getattr(row, "execution_mode", STRATEGY_LEGACY) or STRATEGY_LEGACY),
+                "market_id": str(row.market_id),
+                "side": str(row.side),
+                "size_usd": float(row.size_usd),
+                "entry_price": float(row.entry_price),
+                "entry_fee_usd": float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+                "exit_fee_usd": 0.0,
+                "gross_realized_pnl_usd": float(settlement["gross_realized_pnl_usd"]),
+                "exit_price": float(settlement["settled_price"]),
+                "realized_pnl_usd": float(settlement["net_realized_pnl_usd"]),
+                "close_reason": close_reason,
+                "fallback_mark_close": False,
+                "resolved_outcome_yes": terminal_yes,
             }
 
     async def record_equity_curve(
@@ -330,10 +493,12 @@ class Store:
         state: RiskState,
         equity_usd: float,
         strategy_id: str = STRATEGY_LEGACY,
+        execution_mode: str = STRATEGY_LEGACY,
     ) -> None:
         async with self.session_factory() as session:
             row = EquityCurveORM(
                 strategy_id=strategy_id,
+                execution_mode=execution_mode,
                 timestamp=datetime.now(timezone.utc),
                 equity_usd=equity_usd,
                 daily_drawdown_pct=state.daily_drawdown_pct,
@@ -677,6 +842,29 @@ class Store:
             rows = (await session.execute(sql, {"market_ids": market_ids})).all()
             return {str(row[0]): row[1] for row in rows}
 
+    async def latest_market_outcomes(
+        self,
+        market_ids: list[str],
+    ) -> dict[str, dict[str, object]]:
+        if not market_ids:
+            return {}
+        async with self.session_factory() as session:
+            stmt = select(
+                OutcomeORM.market_id,
+                OutcomeORM.outcome_yes,
+                OutcomeORM.resolved_at,
+                OutcomeORM.status,
+            ).where(OutcomeORM.market_id.in_(market_ids))
+            rows = (await session.execute(stmt)).all()
+            return {
+                str(row[0]): {
+                    "outcome_yes": None if row[1] is None else float(row[1]),
+                    "resolved_at": row[2],
+                    "status": str(row[3] or ""),
+                }
+                for row in rows
+            }
+
     async def market_questions(self, market_ids: list[str]) -> dict[str, str]:
         if not market_ids:
             return {}
@@ -921,6 +1109,133 @@ class Store:
                 )
         return rows
 
+    async def build_training_rows_from_settlements(
+        self,
+        lookback_days: int,
+        max_spread_pct: float | None = None,
+        min_volume_oi_ratio: float | None = None,
+        min_tte_hours: float | None = None,
+        max_sample_weight: float | None = None,
+    ) -> list[dict[str, float | int | str]]:
+        sql = text(
+            """
+            WITH ranked_features AS (
+                SELECT
+                    f.market_id,
+                    f.timestamp AS ts,
+                    f.implied_prob,
+                    f.spread,
+                    f.spread_pct,
+                    f.volume_1h,
+                    f.open_interest,
+                    f.volume_oi_ratio,
+                    f.time_to_expiry_hours,
+                    f.orderbook_imbalance,
+                    f.momentum_20,
+                    f.zscore_20,
+                    f.volatility_20,
+                    f.volatility_30,
+                    o.outcome_yes,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY f.market_id, date_trunc('minute', f.timestamp)
+                        ORDER BY f.timestamp DESC
+                    ) AS rn
+                FROM features f
+                JOIN outcomes o
+                  ON o.market_id = f.market_id
+                WHERE f.timestamp >= NOW() - make_interval(days => :lookback_days)
+                  AND o.outcome_yes IS NOT NULL
+                  AND o.resolved_at IS NOT NULL
+                  AND f.timestamp <= o.resolved_at
+            )
+            SELECT
+                market_id,
+                ts,
+                implied_prob,
+                spread,
+                spread_pct,
+                volume_1h,
+                open_interest,
+                volume_oi_ratio,
+                time_to_expiry_hours,
+                orderbook_imbalance,
+                momentum_20,
+                zscore_20,
+                volatility_20,
+                volatility_30,
+                outcome_yes
+            FROM ranked_features
+            WHERE rn = 1
+            ORDER BY market_id ASC, ts ASC
+            """
+        )
+        rows: list[dict[str, float | int | str]] = []
+        async with self.session_factory() as session:
+            result = await session.execute(
+                sql,
+                {
+                    "lookback_days": int(max(1, lookback_days)),
+                },
+            )
+            for row in result.mappings().all():
+                try:
+                    implied_prob = float(row["implied_prob"])
+                    spread = float(row["spread"])
+                    spread_pct = float(row["spread_pct"] or 0.0)
+                    volume_1h = float(row["volume_1h"])
+                    open_interest = float(row["open_interest"])
+                    volume_oi_ratio = float(row["volume_oi_ratio"] or 0.0)
+                    tte_hours = float(row["time_to_expiry_hours"])
+                    imbalance = float(row["orderbook_imbalance"])
+                    momentum_20 = float(row["momentum_20"] or 0.0)
+                    zscore_20 = float(row["zscore_20"] or 0.0)
+                    volatility_20 = float(row["volatility_20"] or 0.0)
+                    volatility_30 = float(row["volatility_30"])
+                    outcome_yes = float(row["outcome_yes"])
+                except (TypeError, ValueError):
+                    continue
+
+                if outcome_yes not in {0.0, 1.0}:
+                    continue
+                if max_spread_pct is not None and spread_pct > max_spread_pct:
+                    continue
+                if min_volume_oi_ratio is not None and volume_oi_ratio < min_volume_oi_ratio:
+                    continue
+                if min_tte_hours is not None and tte_hours < min_tte_hours:
+                    continue
+
+                time_focus = max(0.0, min(1.0, 1.0 - (tte_hours / 0.10)))
+                spread_bonus = max(0.0, min(1.0, 1.0 - (spread_pct / max(max_spread_pct or 0.05, 0.05))))
+                flow_bonus = max(0.0, min(1.0, volume_oi_ratio / 0.25))
+                imbalance_bonus = max(0.0, min(1.0, abs(imbalance)))
+                weight = 1.0 + (1.25 * time_focus) + (0.35 * flow_bonus) + (0.25 * spread_bonus) + (0.15 * imbalance_bonus)
+                if max_sample_weight is not None:
+                    weight = min(weight, max_sample_weight)
+                weight = min(5.0, max(0.5, weight))
+
+                ts = row["ts"]
+                ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+                rows.append(
+                    {
+                        "timestamp": ts_text,
+                        "implied_prob": implied_prob,
+                        "spread": spread,
+                        "spread_pct": spread_pct,
+                        "volume_1h": volume_1h,
+                        "open_interest": open_interest,
+                        "volume_oi_ratio": volume_oi_ratio,
+                        "time_to_expiry_hours": tte_hours,
+                        "orderbook_imbalance": imbalance,
+                        "momentum_20": momentum_20,
+                        "zscore_20": zscore_20,
+                        "volatility_20": volatility_20,
+                        "volatility_30": volatility_30,
+                        "target": int(outcome_yes >= 0.5),
+                        "sample_weight": round(weight, 6),
+                    }
+                )
+        return rows
+
     async def realized_pnl_window(self, since: datetime, strategy_id: str | None = None) -> float:
         async with self.session_factory() as session:
             filters = [PositionORM.status == "closed", PositionORM.closed_at >= since]
@@ -959,6 +1274,145 @@ class Store:
             if last is None:
                 return self.starting_capital_usd
             return float(last)
+
+    async def open_position_exposure(
+        self,
+        trading_mode: TradingMode,
+        *,
+        strategy_id: str | None = None,
+        execution_mode: str | None = None,
+        market_id: str | None = None,
+        side: str | None = None,
+    ) -> dict[str, float | int]:
+        async with self.session_factory() as session:
+            filters = [
+                PositionORM.status == "open",
+                PositionORM.trading_mode == trading_mode.value,
+            ]
+            if strategy_id is not None:
+                filters.append(PositionORM.strategy_id == strategy_id)
+            if execution_mode is not None:
+                filters.append(PositionORM.execution_mode == execution_mode)
+            if market_id is not None:
+                filters.append(PositionORM.market_id == market_id)
+            if side is not None:
+                filters.append(PositionORM.side == side)
+            count_stmt = select(func.count(PositionORM.id)).where(and_(*filters))
+            notional_stmt = select(func.coalesce(func.sum(PositionORM.size_usd), 0.0)).where(and_(*filters))
+            return {
+                "count": int((await session.scalar(count_stmt)) or 0),
+                "notional_usd": float((await session.scalar(notional_stmt)) or 0.0),
+            }
+
+    async def fill_notional_since(
+        self,
+        since: datetime,
+        *,
+        trading_mode: TradingMode,
+        strategy_id: str | None = None,
+        execution_mode: str | None = None,
+    ) -> float:
+        async with self.session_factory() as session:
+            filters = [
+                PositionORM.opened_at >= since,
+                PositionORM.trading_mode == trading_mode.value,
+            ]
+            if strategy_id is not None:
+                filters.append(PositionORM.strategy_id == strategy_id)
+            if execution_mode is not None:
+                filters.append(PositionORM.execution_mode == execution_mode)
+            stmt = select(func.coalesce(func.sum(PositionORM.size_usd), 0.0)).where(and_(*filters))
+            value = await session.scalar(stmt)
+            return float(value or 0.0)
+
+    async def strategy_compare_summary(
+        self,
+        window_minutes: int,
+        primary_strategy_id: str,
+        secondary_strategy_id: str,
+    ) -> dict[str, float | int]:
+        since = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(window_minutes)))
+        async with self.session_factory() as session:
+            signal_stmt = select(
+                SignalORM.strategy_id,
+                SignalORM.market_id,
+                SignalORM.side,
+                SignalORM.created_at,
+            ).where(
+                and_(
+                    SignalORM.created_at >= since,
+                    SignalORM.strategy_id.in_([primary_strategy_id, secondary_strategy_id]),
+                    SignalORM.status == "filled",
+                )
+            )
+            signal_rows = (await session.execute(signal_stmt)).all()
+
+            close_stmt = select(
+                PositionORM.strategy_id,
+                PositionORM.closed_at,
+                PositionORM.realized_pnl_usd,
+            ).where(
+                and_(
+                    PositionORM.status == "closed",
+                    PositionORM.closed_at >= since,
+                    PositionORM.strategy_id.in_([primary_strategy_id, secondary_strategy_id]),
+                )
+            )
+            close_rows = (await session.execute(close_stmt)).all()
+
+            fallback_stmt = select(func.count(PositionORM.id)).where(
+                and_(
+                    PositionORM.status == "closed",
+                    PositionORM.closed_at >= since,
+                    PositionORM.strategy_id.in_([primary_strategy_id, secondary_strategy_id]),
+                    PositionORM.fallback_mark_close.is_(True),
+                )
+            )
+            fallback_count = int((await session.scalar(fallback_stmt)) or 0)
+
+        bucket_map: dict[tuple[datetime, str], dict[str, str]] = {}
+        for strategy_id, market_id, side_value, created_at in signal_rows:
+            if created_at is None:
+                continue
+            bucket = created_at.replace(second=0, microsecond=0)
+            slot = bucket_map.setdefault((bucket, str(market_id)), {})
+            slot[str(strategy_id)] = str(side_value)
+        both_slots = 0
+        same_side = 0
+        for slot in bucket_map.values():
+            if primary_strategy_id in slot and secondary_strategy_id in slot:
+                both_slots += 1
+                if slot[primary_strategy_id] == slot[secondary_strategy_id]:
+                    same_side += 1
+
+        pnl_a: dict[datetime, float] = {}
+        pnl_b: dict[datetime, float] = {}
+        for strategy_id, closed_at, realized_pnl in close_rows:
+            if closed_at is None:
+                continue
+            bucket = closed_at.replace(second=0, microsecond=0)
+            target = pnl_a if str(strategy_id) == primary_strategy_id else pnl_b
+            target[bucket] = target.get(bucket, 0.0) + float(realized_pnl or 0.0)
+
+        union_buckets = sorted(set(pnl_a) | set(pnl_b))
+        corr = 0.0
+        if len(union_buckets) >= 2:
+            xs = [pnl_a.get(bucket, 0.0) for bucket in union_buckets]
+            ys = [pnl_b.get(bucket, 0.0) for bucket in union_buckets]
+            mean_x = sum(xs) / len(xs)
+            mean_y = sum(ys) / len(ys)
+            cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+            var_x = sum((x - mean_x) ** 2 for x in xs)
+            var_y = sum((y - mean_y) ** 2 for y in ys)
+            if var_x > 0 and var_y > 0:
+                corr = cov / math.sqrt(var_x * var_y)
+
+        return {
+            "same_side_overlap": (same_side / both_slots) if both_slots > 0 else 0.0,
+            "shared_signal_slots": both_slots,
+            "pnl_correlation": max(-1.0, min(1.0, float(corr))),
+            "fallback_mark_close_count": fallback_count,
+        }
 
     async def status_snapshot(self, strategy_id: str | None = None) -> dict[str, float | int]:
         now = datetime.now(timezone.utc)

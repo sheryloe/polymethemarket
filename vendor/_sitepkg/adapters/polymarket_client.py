@@ -22,15 +22,33 @@ class PolymarketClient:
             "X-API-PASSPHRASE": settings.polymarket_api_passphrase,
         }
 
-    async def fetch_markets(self, limit: int = 250) -> list[dict[str, Any]]:
+    async def fetch_markets(
+        self,
+        limit: int = 250,
+        *,
+        active: bool | None = True,
+        closed: bool | None = False,
+        offset: int = 0,
+        order: str | None = None,
+        ascending: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "limit": limit,
+        }
+        if active is not None:
+            params["active"] = active
+        if closed is not None:
+            params["closed"] = closed
+        if offset > 0:
+            params["offset"] = offset
+        if order:
+            params["order"] = order
+        if ascending is not None:
+            params["ascending"] = ascending
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
                 self.settings.polymarket_gamma_url,
-                params={
-                    "limit": limit,
-                    "active": True,
-                    "closed": False,
-                },
+                params=params,
             )
             response.raise_for_status()
             payload = response.json()
@@ -221,4 +239,5 @@ class PolymarketClient:
             status=status,
             fee_usd=fee_usd,
             mode=TradingMode.LIVE,
+            execution_mode=intent.execution_mode,
         )

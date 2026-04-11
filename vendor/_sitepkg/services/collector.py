@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -32,7 +33,10 @@ class CollectorService:
         self.runtime_state = runtime_state
         self.market_ids: list[str] = []
         self.market_stats: dict[str, tuple[float, float]] = {}
+        self.market_expiries: dict[str, datetime | None] = {}
+        self._recent_expiries: dict[str, datetime] = {}
         self._market_ids_version: int = 0
+        self._last_settlement_sync_at: datetime | None = None
 
     async def bootstrap(self) -> None:
         markets = await self.client.fetch_markets(limit=500)
@@ -41,6 +45,7 @@ class CollectorService:
         for tick in selected:
             await self.store.add_market_tick(tick)
             await self.tick_queue.put(tick)
+        await self.sync_settlement_labels()
         logger.info("Bootstrap selected markets=%s", len(self.market_ids))
 
     async def run(self) -> None:
@@ -72,7 +77,7 @@ class CollectorService:
 
     async def _reconciliation_loop(self) -> None:
         while True:
-            await asyncio.sleep(60 if self._contrarian_enabled() else 300)
+            await asyncio.sleep(self._reconciliation_sleep_seconds())
             try:
                 markets = await self.client.fetch_markets(limit=150)
                 selected = await self._select_markets(markets)
@@ -80,10 +85,73 @@ class CollectorService:
                 for tick in selected:
                     await self.store.add_market_tick(tick)
                     await self.tick_queue.put(tick)
+                await self.sync_settlement_labels(force=self._should_force_settlement_sync())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Collector reconciliation error: %s", exc)
+
+    async def sync_settlement_labels(self, force: bool = False) -> dict[str, int]:
+        now = datetime.now(timezone.utc)
+        if not force and self._last_settlement_sync_at is not None:
+            if now - self._last_settlement_sync_at < timedelta(minutes=10):
+                return {"markets": 0, "outcomes": 0, "scanned": 0}
+
+        lookback_days = max(1, min(int(self.settings.training_lookback_days), 7))
+        since = now - timedelta(days=lookback_days)
+        page_size = 500
+        max_pages = 12
+        scanned = 0
+        market_rows: list[dict[str, Any]] = []
+        outcome_rows: list[dict[str, Any]] = []
+        seen_market_ids: set[str] = set()
+
+        for page in range(max_pages):
+            markets = await self.client.fetch_markets(
+                limit=page_size,
+                active=None,
+                closed=True,
+                offset=page * page_size,
+                order="updatedAt",
+                ascending=False,
+            )
+            if not markets:
+                break
+            scanned += len(markets)
+            for market in markets:
+                if not self._matches_contrarian_market(market):
+                    continue
+                if not self._is_resolved_market(market):
+                    continue
+                market_id = self._market_id_from_snapshot(market)
+                if not market_id or market_id in seen_market_ids:
+                    continue
+                resolved_at = self._resolved_at_for_market(market)
+                end_ts = self._parse_end_date(market)
+                reference_ts = resolved_at or end_ts
+                if reference_ts is None or reference_ts < since:
+                    continue
+                outcome_yes = self._infer_outcome_yes(market)
+                if outcome_yes is None:
+                    continue
+                market_rows.append(self._market_metadata_row(market, now))
+                outcome_rows.append(self._outcome_row(market, outcome_yes, resolved_at or end_ts or now, now))
+                seen_market_ids.add(market_id)
+            if len(markets) < page_size:
+                break
+
+        market_count = await self.store.upsert_market_metadata(market_rows)
+        outcome_count = await self.store.upsert_outcomes(outcome_rows)
+        self._last_settlement_sync_at = now
+        if market_count or outcome_count:
+            logger.info(
+                "Settlement sync completed: markets=%s outcomes=%s scanned=%s lookback_days=%s",
+                market_count,
+                outcome_count,
+                scanned,
+                lookback_days,
+            )
+        return {"markets": market_count, "outcomes": outcome_count, "scanned": scanned}
 
     def _passes_liquidity_filter(self, tick: MarketTick) -> bool:
         return (
@@ -211,22 +279,209 @@ class CollectorService:
 
     @staticmethod
     def _parse_end_date(market: dict[str, Any]) -> datetime | None:
-        end_date = market.get("endDate") or market.get("end_date")
-        if isinstance(end_date, str):
+        return CollectorService._parse_datetime_value(market.get("endDate") or market.get("end_date"))
+
+    @staticmethod
+    def _parse_datetime_value(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
             try:
-                if end_date.endswith("Z"):
-                    end_date = end_date[:-1] + "+00:00"
-                return datetime.fromisoformat(end_date).astimezone(timezone.utc)
+                if raw.endswith("Z"):
+                    raw = raw[:-1] + "+00:00"
+                return datetime.fromisoformat(raw).astimezone(timezone.utc)
             except ValueError:
                 return None
         return None
 
+    @staticmethod
+    def _parse_json_list(raw: Any) -> list[Any]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return []
+
+    @staticmethod
+    def _market_id_from_snapshot(market: dict[str, Any]) -> str:
+        return str(
+            market.get("id")
+            or market.get("market")
+            or market.get("market_id")
+            or market.get("conditionId")
+            or ""
+        ).strip()
+
+    def _resolved_at_for_market(self, market: dict[str, Any]) -> datetime | None:
+        return (
+            self._parse_datetime_value(market.get("umaEndDate"))
+            or self._parse_datetime_value(market.get("closedTime"))
+            or self._parse_datetime_value(market.get("closed_time"))
+            or self._parse_end_date(market)
+        )
+
+    def _is_resolved_market(self, market: dict[str, Any]) -> bool:
+        if market.get("closed") is not True:
+            return False
+        resolution_status = str(market.get("umaResolutionStatus") or "").strip().lower()
+        if resolution_status in {"resolved", "settled", "finalized"}:
+            return True
+        return bool(market.get("automaticallyResolved") or market.get("closedTime") or market.get("umaEndDate"))
+
+    def _infer_outcome_yes(self, market: dict[str, Any]) -> float | None:
+        outcomes = [str(v).strip().lower() for v in self._parse_json_list(market.get("outcomes"))]
+        raw_prices = self._parse_json_list(market.get("outcomePrices"))
+        prices: list[float] = []
+        for value in raw_prices:
+            try:
+                prices.append(float(value))
+            except (TypeError, ValueError):
+                prices.append(0.0)
+
+        yes_prob: float | None = None
+        if len(outcomes) >= 2 and len(prices) >= 2:
+            for idx, label in enumerate(outcomes):
+                if idx >= len(prices):
+                    continue
+                if label in {"yes", "up"}:
+                    yes_prob = prices[idx]
+                    break
+                if label in {"no", "down"}:
+                    yes_prob = 1.0 - prices[idx]
+                    break
+        elif prices:
+            yes_prob = prices[0]
+
+        if yes_prob is None:
+            yes_prob = self._to_float(market, ["lastTradePrice", "bestBid", "bestAsk"], fallback=None)
+        if yes_prob is None:
+            return None
+        if yes_prob >= 0.99:
+            return 1.0
+        if yes_prob <= 0.01:
+            return 0.0
+        return None
+
+    def _market_metadata_row(self, market: dict[str, Any], now: datetime) -> dict[str, Any]:
+        market_id = self._market_id_from_snapshot(market)
+        token_ids = [str(v) for v in self._parse_json_list(market.get("clobTokenIds")) if str(v).strip()]
+        token_id = str(
+            market.get("tokenId")
+            or market.get("token_id")
+            or (token_ids[0] if token_ids else "")
+        ).strip()
+        events = market.get("events")
+        event_slug = str(market.get("eventSlug") or market.get("event_slug") or market.get("slug") or "").strip()
+        if isinstance(events, list) and events and isinstance(events[0], dict):
+            event_slug = str(events[0].get("slug") or event_slug).strip()
+        return {
+            "market_id": market_id,
+            "condition_id": str(market.get("conditionId") or market.get("condition_id") or market_id),
+            "token_id": token_id,
+            "token_ids_json": token_ids,
+            "outcomes_json": [str(v) for v in self._parse_json_list(market.get("outcomes"))],
+            "question": str(market.get("question") or market.get("title") or "").strip(),
+            "category": str(market.get("category") or "").strip() or None,
+            "event_slug": event_slug or None,
+            "open_interest": self._to_float(market, ["openInterest", "open_interest", "liquidity"], fallback=0.0),
+            "volume_24h": self._to_float(market, ["volume24hr", "volume24h", "volume"], fallback=0.0),
+            "best_bid": self._to_float(market, ["bestBid", "bid", "best_bid"], fallback=0.0),
+            "best_ask": self._to_float(market, ["bestAsk", "ask", "best_ask"], fallback=0.0),
+            "status": "closed" if market.get("closed") is True else "active",
+            "end_ts": self._parse_end_date(market),
+            "source": "gamma",
+            "ingested_at": now,
+            "idempotency_key": f"market:{market_id}",
+            "raw_json": market,
+        }
+
+    def _outcome_row(
+        self,
+        market: dict[str, Any],
+        outcome_yes: float,
+        resolved_at: datetime,
+        now: datetime,
+    ) -> dict[str, Any]:
+        market_id = self._market_id_from_snapshot(market)
+        return {
+            "market_id": market_id,
+            "outcome_yes": float(outcome_yes),
+            "resolved_at": resolved_at,
+            "status": "resolved",
+            "source": "gamma",
+            "ingested_at": now,
+            "idempotency_key": f"outcome:{market_id}",
+            "raw_json": market,
+        }
+
     def _update_market_ids(self, ticks: list[MarketTick]) -> None:
+        now = datetime.now(timezone.utc)
+        timeout = max(5, int(self.settings.outcome_resolution_timeout_seconds))
+        previous_expiries = dict(self.market_expiries)
         new_ids = [t.market_id for t in ticks]
         if new_ids != self.market_ids:
+            removed_ids = [market_id for market_id in self.market_ids if market_id not in new_ids]
+            for market_id in removed_ids:
+                expiry = previous_expiries.get(market_id)
+                if isinstance(expiry, datetime):
+                    self._recent_expiries[market_id] = expiry
+            self._recent_expiries = {
+                market_id: expiry
+                for market_id, expiry in self._recent_expiries.items()
+                if isinstance(expiry, datetime) and now <= expiry + timedelta(seconds=timeout)
+            }
             self.market_ids = new_ids
             self._market_ids_version += 1
+            logger.info("Contrarian market rollover ids=%s recent_expiries=%s", self.market_ids, len(self._recent_expiries))
         self.market_stats = {t.market_id: (t.volume_1h, t.open_interest) for t in ticks}
+        self.market_expiries = {t.market_id: t.expiry_ts for t in ticks}
+
+    def _reconciliation_sleep_seconds(self) -> int:
+        if not self._contrarian_enabled():
+            return 300
+        if not self.market_ids:
+            return max(1, int(self.settings.strategy_reconcile_idle_seconds))
+        now = datetime.now(timezone.utc)
+        expiries = [expiry for expiry in self.market_expiries.values() if isinstance(expiry, datetime)]
+        if not expiries:
+            return max(1, int(self.settings.strategy_reconcile_idle_seconds))
+        nearest = min(expiries)
+        if nearest <= now + timedelta(seconds=90):
+            return max(1, int(self.settings.strategy_reconcile_near_expiry_seconds))
+        return max(1, int(self.settings.strategy_reconcile_normal_seconds))
+
+    def _should_force_settlement_sync(self) -> bool:
+        if not self._contrarian_enabled():
+            return False
+        now = datetime.now(timezone.utc)
+        timeout = max(5, int(self.settings.outcome_resolution_timeout_seconds))
+        for expiry in self._iter_expiries_for_settlement_sync(now):
+            if not isinstance(expiry, datetime):
+                continue
+            if expiry <= now <= expiry + timedelta(seconds=timeout):
+                return True
+        return False
+
+    def _iter_expiries_for_settlement_sync(self, now: datetime) -> list[datetime]:
+        timeout = max(5, int(self.settings.outcome_resolution_timeout_seconds))
+        self._recent_expiries = {
+            market_id: expiry
+            for market_id, expiry in self._recent_expiries.items()
+            if isinstance(expiry, datetime) and now <= expiry + timedelta(seconds=timeout)
+        }
+        expiries = [expiry for expiry in self.market_expiries.values() if isinstance(expiry, datetime)]
+        expiries.extend(self._recent_expiries.values())
+        return expiries
 
     @staticmethod
     def _to_float(market: dict[str, Any], keys: list[str], fallback: float = 0.0) -> float:
@@ -239,13 +494,7 @@ class CollectorService:
         return fallback
 
     def _tick_from_market_snapshot(self, market: dict[str, Any]) -> MarketTick | None:
-        market_id = str(
-            market.get("id")
-            or market.get("market")
-            or market.get("market_id")
-            or market.get("conditionId")
-            or ""
-        )
+        market_id = self._market_id_from_snapshot(market)
         if not market_id:
             return None
         bid = self._to_float(market, ["bestBid", "bid", "best_bid"])

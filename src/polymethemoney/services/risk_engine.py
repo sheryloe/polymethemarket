@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import logging
@@ -6,7 +6,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from polymethemoney.config import Settings
-from polymethemoney.domain import AB_STRATEGY_IDS, Decision, DecisionType, RiskState, Signal, TradingMode
+from polymethemoney.domain import (
+    Decision,
+    DecisionType,
+    EXECUTION_MODE_FUNDED_PAPER,
+    EXECUTION_MODE_SHADOW_PAPER,
+    RiskState,
+    Signal,
+    TradingMode,
+    get_strategy_spec,
+    iter_active_strategy_specs,
+)
 from polymethemoney.services.gatekeeper import Gatekeeper
 from polymethemoney.state import RuntimeState
 from polymethemoney.storage import Store
@@ -33,9 +43,10 @@ class RiskEngine:
         self.state = RiskState()
 
     async def run(self) -> None:
+        interval = max(1, int(self.settings.expiry_close_poll_seconds))
         while True:
             await self.refresh_state()
-            await asyncio.sleep(60)
+            await asyncio.sleep(interval)
 
     async def refresh_state(self) -> RiskState:
         now = datetime.now(timezone.utc)
@@ -48,101 +59,104 @@ class RiskEngine:
         elif not self._is_demo_unlimited():
             await self._enforce_position_exit_rules(now)
 
-        day_pnl = await self.store.realized_pnl_window(now - timedelta(days=1))
-        week_pnl = await self.store.realized_pnl_window(now - timedelta(days=7))
-        capital_base = self._portfolio_capital() * (len(AB_STRATEGY_IDS) if self.settings.ab_test_enabled else 1)
+        funded_strategy_ids = [spec.strategy_id for spec in iter_active_strategy_specs() if spec.execution_mode == EXECUTION_MODE_FUNDED_PAPER]
+        day_pnl = 0.0
+        week_pnl = 0.0
+        for strategy_id in funded_strategy_ids:
+            day_pnl += await self.store.realized_pnl_window(now - timedelta(days=1), strategy_id=strategy_id)
+            week_pnl += await self.store.realized_pnl_window(now - timedelta(days=7), strategy_id=strategy_id)
 
-        self.state.daily_drawdown_pct = max(0.0, -day_pnl / max(1.0, capital_base))
-        self.state.weekly_drawdown_pct = max(0.0, -week_pnl / max(1.0, capital_base))
+        capital_base = max(1.0, float(self.settings.funded_starting_capital_usd))
+        self.state.daily_drawdown_pct = max(0.0, -day_pnl / capital_base)
+        self.state.weekly_drawdown_pct = max(0.0, -week_pnl / capital_base)
         self.state.trading_mode = self.runtime_state.trading_mode
         self.state.paused = self.runtime_state.paused
 
-        if self.settings.ab_test_enabled:
-            for strategy_id in AB_STRATEGY_IDS:
-                await self.store.record_equity_curve(
-                    self.state,
-                    await self.estimated_equity(strategy_id=strategy_id),
-                    strategy_id=strategy_id,
-                )
-        else:
-            await self.store.record_equity_curve(self.state, await self.estimated_equity())
+        for spec in iter_active_strategy_specs():
+            equity = await self.estimated_equity(strategy_id=spec.strategy_id)
+            await self.store.record_equity_curve(
+                self.state,
+                equity,
+                strategy_id=spec.strategy_id,
+                execution_mode=spec.execution_mode,
+            )
         return self.state
 
     async def decide(self, signal: Signal, open_positions: int) -> Decision:
         await self.refresh_state()
-
         if self.runtime_state.paused:
             return Decision(kind=DecisionType.REJECT, reason="paused")
 
-        if self.settings.ab_test_enabled:
-            max_positions = max(1, int(self.settings.model_max_positions))
-            if open_positions >= max_positions:
-                return Decision(kind=DecisionType.REJECT, reason="max_positions_reached")
-            size_usd = max(0.0, min(float(self.settings.max_position_usd), float(self.settings.model_position_usd)))
-            if size_usd <= 0:
-                return Decision(kind=DecisionType.REJECT, reason="size_below_min")
-            return Decision(kind=DecisionType.AUTO, reason=signal.strategy_id, size_usd=size_usd)
+        spec = get_strategy_spec(signal.strategy_id)
+        strategy_open = await self.store.open_position_exposure(
+            self.runtime_state.trading_mode,
+            strategy_id=signal.strategy_id,
+        )
+        if int(strategy_open["count"]) >= max(1, int(spec.max_positions)):
+            return Decision(kind=DecisionType.REJECT, reason="strategy_max_positions")
 
-        if self.settings.contrarian_enabled:
-            max_positions = max(1, int(self.settings.contrarian_max_positions))
-            if open_positions >= max_positions:
-                return Decision(kind=DecisionType.REJECT, reason="max_positions_reached")
-            size_usd = max(
-                0.0,
-                min(float(self.settings.max_position_usd), float(self.settings.contrarian_position_usd)),
+        if spec.execution_mode == EXECUTION_MODE_SHADOW_PAPER:
+            return Decision(
+                kind=DecisionType.AUTO,
+                reason="shadow_strategy",
+                size_usd=float(self.settings.shadow_position_usd),
             )
-            if size_usd <= 0:
-                return Decision(kind=DecisionType.REJECT, reason="size_below_min")
-            return Decision(kind=DecisionType.AUTO, reason="contrarian", size_usd=size_usd)
 
-        if self._is_demo_unlimited():
-            size_usd = max(self.settings.min_position_usd, self.settings.max_position_usd)
-            return Decision(kind=DecisionType.AUTO, reason="demo_unlimited", size_usd=size_usd)
-
-        if open_positions >= self.settings.max_positions:
-            return Decision(kind=DecisionType.REJECT, reason="max_positions_reached")
         if signal.net_ev <= 0:
             return Decision(kind=DecisionType.REJECT, reason="negative_net_ev")
+        if abs(float(signal.fair_prob) - float(signal.implied_prob)) < float(self.settings.funded_min_prediction_gap):
+            return Decision(kind=DecisionType.REJECT, reason="prediction_gap_too_small")
+        if float(signal.model_confidence) < float(self.settings.funded_min_model_confidence):
+            return Decision(kind=DecisionType.REJECT, reason="low_confidence")
+        if float(getattr(signal, "effective_edge", signal.edge)) <= 0:
+            return Decision(kind=DecisionType.REJECT, reason="non_positive_edge")
 
-        size_usd = self._position_size_usd(signal)
-        if size_usd <= 0:
-            return Decision(kind=DecisionType.REJECT, reason="size_below_min")
-        if signal.score >= self.settings.auto_threshold:
-            return Decision(kind=DecisionType.AUTO, reason="auto_threshold", size_usd=size_usd)
-        if signal.score >= self.settings.semi_threshold:
-            return Decision(kind=DecisionType.SEMI, reason="semi_threshold", size_usd=size_usd)
-        return Decision(kind=DecisionType.REJECT, reason="score_below_threshold")
+        funded_total = await self.store.open_position_exposure(
+            self.runtime_state.trading_mode,
+            execution_mode=EXECUTION_MODE_FUNDED_PAPER,
+        )
+        if int(funded_total["count"]) >= int(self.settings.funded_max_open_positions):
+            return Decision(kind=DecisionType.REJECT, reason="funded_max_open_positions")
+
+        size_usd = float(self.settings.funded_position_usd)
+        if float(funded_total["notional_usd"]) + size_usd > float(self.settings.funded_max_open_notional_usd) + 1e-9:
+            return Decision(kind=DecisionType.REJECT, reason="funded_max_open_notional")
+
+        funded_market_side = await self.store.open_position_exposure(
+            self.runtime_state.trading_mode,
+            execution_mode=EXECUTION_MODE_FUNDED_PAPER,
+            market_id=signal.market_id,
+            side=signal.side.value,
+        )
+        if float(funded_market_side["notional_usd"]) + size_usd > float(self.settings.funded_same_market_side_max_notional_usd) + 1e-9:
+            return Decision(kind=DecisionType.REJECT, reason="funded_same_market_side_cap")
+
+        slot_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        slot_notional = await self.store.fill_notional_since(
+            slot_start,
+            trading_mode=self.runtime_state.trading_mode,
+            execution_mode=EXECUTION_MODE_FUNDED_PAPER,
+        )
+        if slot_notional + size_usd > float(self.settings.funded_slot_new_notional_usd) + 1e-9:
+            return Decision(kind=DecisionType.REJECT, reason="funded_slot_notional_cap")
+
+        return Decision(kind=DecisionType.AUTO, reason="funded_strategy", size_usd=size_usd)
 
     async def estimated_equity(self, strategy_id: str | None = None) -> float:
         now = datetime.now(timezone.utc)
+        if strategy_id is None:
+            total_pnl = await self.store.realized_pnl_window(now - timedelta(days=3650))
+            return float(self.settings.starting_capital_usd) + total_pnl
+        spec = get_strategy_spec(strategy_id)
         total_pnl = await self.store.realized_pnl_window(now - timedelta(days=3650), strategy_id=strategy_id)
-        return self._portfolio_capital() + total_pnl
+        capital_base = self._portfolio_capital_for_mode(spec.execution_mode)
+        return capital_base + total_pnl
 
-    def _position_size_usd(self, signal: Signal) -> float:
-        if self.settings.fixed_position_usd > 0:
-            fixed = float(self.settings.fixed_position_usd)
-            return max(0.0, min(self.settings.max_position_usd, fixed))
-
-        min_position_usd = (
-            self.runtime_state.min_position_usd_override
-            if self.runtime_state.min_position_usd_override is not None
-            else self.settings.min_position_usd
-        )
-        implied = max(0.001, min(0.999, signal.implied_prob))
-        fair = max(0.001, min(0.999, signal.fair_prob))
-        odds = (1.0 - implied) / implied
-        full_kelly = ((odds * fair) - (1.0 - fair)) / max(odds, 1e-6)
-        scaled_kelly = max(0.0, full_kelly) * self.settings.kelly_fraction
-        confidence_scale = 0.35 + (0.65 * max(0.0, min(1.0, signal.model_confidence)))
-        bankroll_fraction = scaled_kelly * confidence_scale
-        size = self.settings.starting_capital_usd * bankroll_fraction
-        if size < min_position_usd:
-            return 0.0
-        return max(min_position_usd, min(self.settings.max_position_usd, size))
-
-    def _portfolio_capital(self) -> float:
-        if self.settings.ab_test_enabled:
-            return float(self.settings.model_portfolio_starting_capital_usd)
+    def _portfolio_capital_for_mode(self, execution_mode: str) -> float:
+        if execution_mode == EXECUTION_MODE_FUNDED_PAPER:
+            return float(self.settings.funded_starting_capital_usd)
+        if execution_mode == EXECUTION_MODE_SHADOW_PAPER:
+            return float(self.settings.shadow_starting_capital_usd)
         return float(self.settings.starting_capital_usd)
 
     def _is_demo_unlimited(self) -> bool:
@@ -170,45 +184,44 @@ class RiskEngine:
 
             mark_price = (1.0 - float(yes_price)) if side == "NO" else float(yes_price)
             mark_price = max(0.001, min(0.999, mark_price))
-            shares = float(row.size_usd) / max(float(row.entry_price), 0.001)
-            unrealized_pnl = (shares * mark_price) - float(row.size_usd)
+            mtm = Store.estimate_position_unrealized(
+                size_usd=float(row.size_usd),
+                entry_price=float(row.entry_price),
+                mark_price=mark_price,
+                entry_fee_usd=float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+                exit_fee_bps=float(self.settings.taker_fee_bps),
+            )
+            unrealized_pnl = float(mtm["net_unrealized_pnl_usd"])
             pnl_pct = unrealized_pnl / max(float(row.size_usd), 0.001)
-
             hit_stop_loss = stop_loss_threshold > 0 and (-pnl_pct) >= stop_loss_threshold
             hit_take_profit = take_profit_threshold > 0 and pnl_pct >= take_profit_threshold
             if not hit_stop_loss and not hit_take_profit:
                 continue
-
             closed = await self.store.close_position_at_mark(
                 position_id=int(row.id),
                 mark_price=mark_price,
                 mode=TradingMode.PAPER,
+                exit_fee_bps=float(self.settings.taker_fee_bps),
                 strategy_id=str(getattr(row, "strategy_id", "")) or None,
+                close_reason="stop_loss" if hit_stop_loss else "take_profit",
             )
             if closed is None:
                 continue
-
             realized = float(closed["realized_pnl_usd"])
-            order_id = f"{'tp' if hit_take_profit else 'sl'}-{closed['position_id']}-{int(now.timestamp())}"
             await self.store.add_fill(
-                order_id=order_id,
+                order_id=f"{'tp' if hit_take_profit else 'sl'}-{closed['position_id']}-{int(now.timestamp())}",
                 market_id=str(closed["market_id"]),
                 side=side,
                 fill_price=float(closed["exit_price"]),
                 size_usd=float(closed["size_usd"]),
-                fee_usd=0.0,
+                fee_usd=float(closed.get("exit_fee_usd", 0.0) or 0.0),
                 pnl_usd=realized,
                 trading_mode=TradingMode.PAPER,
                 strategy_id=str(closed.get("strategy_id") or ""),
+                execution_mode=str(closed.get("execution_mode") or "legacy"),
             )
             if realized != 0.0:
                 await self.gatekeeper.register_paper_trade(realized, when=now)
-            await self.alert_fn(
-                "[리스크 청산]\n"
-                f"시장 {closed['market_id']} | 방향 {side}\n"
-                f"진입 {closed['entry_price']:.4f} -> 청산 {closed['exit_price']:.4f}\n"
-                f"실현 손익 {realized:+.2f} USD"
-            )
 
     async def _enforce_expiry_rules(self, now: datetime) -> None:
         if self.runtime_state.trading_mode != TradingMode.PAPER:
@@ -218,8 +231,10 @@ class RiskEngine:
         if not open_positions:
             return
 
-        expiries = await self.store.latest_market_expiries([str(row.market_id) for row in open_positions])
+        market_ids = [str(row.market_id) for row in open_positions]
+        expiries = await self.store.latest_market_expiries(market_ids)
         grace = timedelta(seconds=max(0, int(self.settings.contrarian_expiry_grace_seconds)))
+        timeout = timedelta(seconds=max(5, int(self.settings.outcome_resolution_timeout_seconds)))
         expired_rows = [
             row
             for row in open_positions
@@ -228,74 +243,77 @@ class RiskEngine:
         if not expired_rows:
             return
 
-        latest_prices = await self.store.latest_market_prices([str(row.market_id) for row in expired_rows])
-        closed_count = 0
-        realized_total = 0.0
-        strategy_counts: dict[str, int] = {}
-
+        outcomes = await self.store.latest_market_outcomes([str(row.market_id) for row in expired_rows])
+        fallback_rows = []
         for row in expired_rows:
             market_id = str(row.market_id)
-            side = str(row.side).upper()
+            outcome = outcomes.get(market_id)
+            outcome_yes = None if outcome is None else outcome.get("outcome_yes")
+            if outcome_yes in {0.0, 1.0}:
+                closed = await self.store.close_position_at_settlement(
+                    position_id=int(row.id),
+                    outcome_yes=float(outcome_yes),
+                    mode=TradingMode.PAPER,
+                    strategy_id=str(getattr(row, "strategy_id", "")) or None,
+                )
+                if closed is None:
+                    continue
+                realized = float(closed["realized_pnl_usd"])
+                await self.store.add_fill(
+                    order_id=f"expiry-{int(row.id)}-{int(now.timestamp())}",
+                    market_id=market_id,
+                    side=str(closed["side"]),
+                    fill_price=float(closed["exit_price"]),
+                    size_usd=float(closed["size_usd"]),
+                    fee_usd=0.0,
+                    pnl_usd=realized,
+                    trading_mode=TradingMode.PAPER,
+                    strategy_id=str(closed.get("strategy_id") or ""),
+                    execution_mode=str(closed.get("execution_mode") or "legacy"),
+                )
+                if realized != 0.0:
+                    await self.gatekeeper.register_paper_trade(realized, when=now)
+                continue
+
+            expiry = expiries.get(market_id)
+            if expiry is not None and now >= expiry + timeout:
+                fallback_rows.append(row)
+
+        if not fallback_rows:
+            return
+
+        latest_prices = await self.store.latest_market_prices([str(row.market_id) for row in fallback_rows])
+        for row in fallback_rows:
+            market_id = str(row.market_id)
             yes_price = latest_prices.get(market_id)
             if yes_price is None:
                 continue
-
+            side = str(row.side).upper()
             mark_price = (1.0 - float(yes_price)) if side == "NO" else float(yes_price)
             mark_price = max(0.001, min(0.999, mark_price))
-            strategy_id = str(getattr(row, "strategy_id", "")) or None
             closed = await self.store.close_position_at_mark(
                 position_id=int(row.id),
                 mark_price=mark_price,
                 mode=TradingMode.PAPER,
-                strategy_id=strategy_id,
+                exit_fee_bps=float(self.settings.taker_fee_bps),
+                strategy_id=str(getattr(row, "strategy_id", "")) or None,
+                close_reason="fallback_mark_close",
+                fallback_mark_close=True,
             )
             if closed is None:
                 continue
-
             realized = float(closed["realized_pnl_usd"])
             await self.store.add_fill(
-                order_id=f"expiry-{int(row.id)}-{int(now.timestamp())}",
+                order_id=f"fallback-{int(row.id)}-{int(now.timestamp())}",
                 market_id=market_id,
                 side=side,
                 fill_price=float(closed["exit_price"]),
                 size_usd=float(closed["size_usd"]),
-                fee_usd=0.0,
+                fee_usd=float(closed.get("exit_fee_usd", 0.0) or 0.0),
                 pnl_usd=realized,
                 trading_mode=TradingMode.PAPER,
                 strategy_id=str(closed.get("strategy_id") or ""),
+                execution_mode=str(closed.get("execution_mode") or "legacy"),
             )
             if realized != 0.0:
                 await self.gatekeeper.register_paper_trade(realized, when=now)
-
-            closed_count += 1
-            realized_total += realized
-            label = str(closed.get("strategy_id") or "legacy")
-            strategy_counts[label] = strategy_counts.get(label, 0) + 1
-
-        if closed_count <= 0:
-            return
-
-        if self.settings.ab_test_enabled:
-            parts = []
-            for strategy_id in AB_STRATEGY_IDS:
-                equity = await self.estimated_equity(strategy_id=strategy_id)
-                base = max(1.0, self._portfolio_capital())
-                ret = (equity - base) / base
-                count = strategy_counts.get(strategy_id, 0)
-                label = "모델 A" if strategy_id == AB_STRATEGY_IDS[0] else "모델 B"
-                parts.append(f"{label} {count}건 | 누적 {equity - base:+.2f} USD ({ret:+.2%})")
-            await self.alert_fn(
-                "[만기 청산]\n"
-                f"총 {closed_count}건 청산 | 실현 {realized_total:+.2f} USD\n"
-                + "\n".join(parts)
-            )
-            return
-
-        equity = await self.estimated_equity()
-        base = max(1.0, self._portfolio_capital())
-        ret = (equity - base) / base
-        await self.alert_fn(
-            "[만기 청산]\n"
-            f"총 {closed_count}건 청산 | 실현 {realized_total:+.2f} USD\n"
-            f"누적 손익 {equity - base:+.2f} USD | 누적 수익률 {ret:+.2%}"
-        )

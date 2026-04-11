@@ -15,6 +15,7 @@ def _test_settings(**overrides: object) -> Settings:
     base = {
         "DATABASE_URL": "postgresql+asyncpg://x:x@x:5432/x",
         "REDIS_URL": "redis://localhost:6379/0",
+        "CONTRARIAN_ENABLED": False,
         "AB_TEST_ENABLED": False,
         "PAPER_PERF_TUNE_ENABLED": True,
         "PAPER_PERF_TUNE_ONLY_IN_PAPER": True,
@@ -140,6 +141,6 @@ async def test_collect_recent_paper_performance_uses_realized_plus_unrealized_re
     assert fake_store.requested_market_ids == ["m1", "m2"]
     assert result["trades"] == 6
     assert result["realized_pnl"] == pytest.approx(-120.0)
-    assert result["unrealized_pnl"] == pytest.approx(-36.6666666667, rel=1e-6)
-    assert result["pnl_usd"] == pytest.approx(-156.6666666667, rel=1e-6)
-    assert result["return_rate"] == pytest.approx(-156.6666666667 / 4000.0, rel=1e-6)
+    assert result["unrealized_pnl"] == pytest.approx(-36.78, rel=1e-6)
+    assert result["pnl_usd"] == pytest.approx(-156.78, rel=1e-6)
+    assert result["return_rate"] == pytest.approx(-156.78 / 4000.0, rel=1e-6)

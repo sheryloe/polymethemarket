@@ -93,6 +93,7 @@ class PaperExchange:
                 status="rejected_no_quote",
                 fee_usd=0.0,
                 mode=TradingMode.PAPER,
+                execution_mode=intent.execution_mode,
                 created_at=datetime.now(timezone.utc),
             )
 
@@ -114,6 +115,7 @@ class PaperExchange:
                 status="filled",
                 fee_usd=fee_usd,
                 mode=TradingMode.PAPER,
+                execution_mode=intent.execution_mode,
                 created_at=datetime.now(timezone.utc),
             )
 
@@ -128,6 +130,7 @@ class PaperExchange:
                 status="rejected_bad_quote",
                 fee_usd=0.0,
                 mode=TradingMode.PAPER,
+                execution_mode=intent.execution_mode,
                 created_at=datetime.now(timezone.utc),
             )
 
@@ -143,6 +146,7 @@ class PaperExchange:
                 status="rejected_wide_spread",
                 fee_usd=0.0,
                 mode=TradingMode.PAPER,
+                execution_mode=intent.execution_mode,
                 created_at=datetime.now(timezone.utc),
             )
 
@@ -167,6 +171,7 @@ class PaperExchange:
                         status="rejected_post_only",
                         fee_usd=0.0,
                         mode=TradingMode.PAPER,
+                        execution_mode=intent.execution_mode,
                         created_at=datetime.now(timezone.utc),
                     )
                 if intent.price <= yes_bid:
@@ -192,6 +197,7 @@ class PaperExchange:
                         status="rejected_post_only",
                         fee_usd=0.0,
                         mode=TradingMode.PAPER,
+                        execution_mode=intent.execution_mode,
                         created_at=datetime.now(timezone.utc),
                     )
                 if intent.price <= no_bid:
@@ -217,6 +223,7 @@ class PaperExchange:
                 status="unfilled",
                 fee_usd=0.0,
                 mode=TradingMode.PAPER,
+                execution_mode=intent.execution_mode,
                 created_at=datetime.now(timezone.utc),
             )
 
@@ -231,6 +238,7 @@ class PaperExchange:
             status="filled",
             fee_usd=fee_usd,
             mode=TradingMode.PAPER,
+            execution_mode=intent.execution_mode,
             created_at=datetime.now(timezone.utc),
         )
 

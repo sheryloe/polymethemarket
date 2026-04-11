@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 from polymethemoney.adapters import PaperExchange, PolymarketClient
 from polymethemoney.config import Settings
 from polymethemoney.db import create_engine_and_session, init_db
-from polymethemoney.domain import AB_STRATEGY_IDS, STRATEGY_MODEL_A, STRATEGY_MODEL_B, FeatureVector, MarketTick, TradingMode
+from polymethemoney.domain import FeatureVector, MarketTick, TradingMode, iter_active_strategy_specs
 from polymethemoney.services import (
     CollectorService,
     ContrarianEngine,
@@ -70,11 +70,8 @@ class TradingApp:
         self.engine, session_factory = create_engine_and_session(self.settings.database_url)
         await init_db(self.engine)
         self.redis = Redis.from_url(self.settings.redis_url, decode_responses=False)
-        base_capital = (
-            self.settings.model_portfolio_starting_capital_usd
-            if self.settings.ab_test_enabled
-            else self.settings.starting_capital_usd
-        )
+        strategy_specs = list(iter_active_strategy_specs())
+        base_capital = self.settings.funded_starting_capital_usd if strategy_specs else self.settings.starting_capital_usd
         store = Store(session_factory, base_capital)
 
         configured_mode = (
@@ -87,14 +84,9 @@ class TradingApp:
             logger.warning("DEMO_PAPER_HARDLOCK enabled: forcing TRADING_MODE from %s to paper", configured_mode.value)
         runtime = RuntimeState(trading_mode=runtime_mode)
         tick_queue: asyncio.Queue[MarketTick] = asyncio.Queue(maxsize=10_000)
-        feature_queues: list[asyncio.Queue[FeatureVector]]
-        if self.settings.ab_test_enabled:
-            feature_queues = [
-                asyncio.Queue(maxsize=10_000),
-                asyncio.Queue(maxsize=10_000),
-            ]
-        else:
-            feature_queues = [asyncio.Queue(maxsize=10_000)]
+        feature_queues: list[asyncio.Queue[FeatureVector]] = [
+            asyncio.Queue(maxsize=10_000) for _ in range(max(1, len(strategy_specs) if (self.settings.contrarian_enabled or self.settings.ab_test_enabled) else 1))
+        ]
         notifier = NotificationHub()
 
         self._apply_hard_limits()
@@ -161,43 +153,19 @@ class TradingApp:
             paper_exchange=paper_exchange,
         )
         signal_tasks: list[asyncio.Task] = []
-        if self.settings.ab_test_enabled:
-            model_a_engine = ContrarianEngine(
-                settings=self.settings,
-                feature_queue=feature_queues[0],
-                model_engine=model_engine,
-                execution_engine=execution_engine,
-                store=store,
-                runtime_state=runtime,
-                strategy_id=STRATEGY_MODEL_A,
-                model_variant="model_a",
-                direction_mode="contrarian",
-            )
-            model_b_engine = ContrarianEngine(
-                settings=self.settings,
-                feature_queue=feature_queues[1],
-                model_engine=model_engine,
-                execution_engine=execution_engine,
-                store=store,
-                runtime_state=runtime,
-                strategy_id=STRATEGY_MODEL_B,
-                model_variant="model_b",
-                direction_mode="direct",
-            )
-            signal_tasks = [
-                asyncio.create_task(model_a_engine.run(), name="signal_engine_model_a"),
-                asyncio.create_task(model_b_engine.run(), name="signal_engine_model_b"),
-            ]
-        elif self.settings.contrarian_enabled:
-            signal_engine = ContrarianEngine(
-                settings=self.settings,
-                feature_queue=feature_queues[0],
-                model_engine=model_engine,
-                execution_engine=execution_engine,
-                store=store,
-                runtime_state=runtime,
-            )
-            signal_tasks = [asyncio.create_task(signal_engine.run(), name="signal_engine")]
+        if self.settings.contrarian_enabled or self.settings.ab_test_enabled:
+            for idx, spec in enumerate(strategy_specs):
+                engine = ContrarianEngine(
+                    settings=self.settings,
+                    feature_queue=feature_queues[idx],
+                    model_engine=model_engine,
+                    execution_engine=execution_engine,
+                    store=store,
+                    runtime_state=runtime,
+                    strategy_id=spec.strategy_id,
+                    strategy_spec=spec,
+                )
+                signal_tasks.append(asyncio.create_task(engine.run(), name=f"signal_engine_{spec.strategy_id}"))
         else:
             signal_engine = SignalEngine(
                 settings=self.settings,
@@ -208,7 +176,7 @@ class TradingApp:
             )
             signal_tasks = [asyncio.create_task(signal_engine.run(), name="signal_engine")]
         structure_alpha = None
-        if self.settings.arb_enabled and not self.settings.ab_test_enabled:
+        if self.settings.arb_enabled and not (self.settings.contrarian_enabled or self.settings.ab_test_enabled):
             structure_alpha = StructureAlphaService(
                 settings=self.settings,
                 store=store,
@@ -221,7 +189,7 @@ class TradingApp:
 
         if self.settings.demo_paper_hardlock and self.settings.demo_reset_paper_on_startup:
             reset = await store.reset_paper_open_positions(
-                strategy_ids=list(AB_STRATEGY_IDS) if self.settings.ab_test_enabled else None
+                strategy_ids=[spec.strategy_id for spec in strategy_specs] if strategy_specs else None
             )
             logger.warning(
                 "paper startup reset executed by config: positions=%s structure_legs=%s structure_bundles=%s",
@@ -232,6 +200,7 @@ class TradingApp:
         elif self.settings.demo_paper_hardlock:
             logger.info("paper startup reset skipped (DEMO_RESET_PAPER_ON_STARTUP=false)")
 
+        await collector.sync_settlement_labels(force=True)
         await model_engine.retrain_incremental()
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.scheduler.add_job(
@@ -240,7 +209,7 @@ class TradingApp:
             id="incremental_retrain",
             replace_existing=True,
         )
-        if not self.settings.ab_test_enabled and self.settings.paper_perf_tune_enabled:
+        if not (self.settings.contrarian_enabled or self.settings.ab_test_enabled) and self.settings.paper_perf_tune_enabled:
             primary_hours = max(1, self.settings.paper_perf_tune_interval_hours)
             self.scheduler.add_job(
                 self._paper_performance_guard,
@@ -264,7 +233,7 @@ class TradingApp:
                     max_instances=1,
                     kwargs={"window_hours": secondary_hours},
                 )
-        if self.settings.auto_threshold_tune_enabled and not self.settings.ab_test_enabled:
+        if self.settings.auto_threshold_tune_enabled and not (self.settings.contrarian_enabled or self.settings.ab_test_enabled):
             window_minutes = max(15, int(self.settings.auto_threshold_tune_window_minutes))
             self.scheduler.add_job(
                 self._auto_threshold_tune_guard,
@@ -326,7 +295,7 @@ class TradingApp:
                 await self.engine.dispose()
 
     async def _paper_performance_guard(self, window_hours: int | None = None) -> None:
-        if self.settings.ab_test_enabled:
+        if self.settings.contrarian_enabled or self.settings.ab_test_enabled:
             return
         if not self.settings.paper_perf_tune_enabled:
             return
@@ -640,7 +609,7 @@ class TradingApp:
             await self._notify(f"[paper 튜닝] 재학습 실패: {exc}")
 
     async def _collect_recent_paper_performance(self, window_hours: int) -> dict[str, float | int] | None:
-        if self.settings.ab_test_enabled:
+        if self.settings.contrarian_enabled or self.settings.ab_test_enabled:
             return None
         if self.store is None:
             return None
@@ -663,8 +632,14 @@ class TradingApp:
                 mark_price = max(0.001, min(0.999, 1.0 - yes_price)) if side == "NO" else max(
                     0.001, min(0.999, yes_price)
                 )
-                shares = float(row.size_usd) / max(float(row.entry_price), 0.001)
-                unrealized_pnl += (shares * mark_price) - float(row.size_usd)
+                mtm = Store.estimate_position_unrealized(
+                    size_usd=float(row.size_usd),
+                    entry_price=float(row.entry_price),
+                    mark_price=mark_price,
+                    entry_fee_usd=float(getattr(row, "entry_fee_usd", 0.0) or 0.0),
+                    exit_fee_bps=float(self.settings.taker_fee_bps),
+                )
+                unrealized_pnl += float(mtm["net_unrealized_pnl_usd"])
 
             total_pnl = realized_pnl + unrealized_pnl
             base_capital_usd = float(self.settings.starting_capital_usd)
@@ -690,7 +665,7 @@ class TradingApp:
         return previous, new_policy
 
     async def _auto_threshold_tune_guard(self, window_minutes: int | None = None) -> None:
-        if self.settings.ab_test_enabled:
+        if self.settings.contrarian_enabled or self.settings.ab_test_enabled:
             return
         if not self.settings.auto_threshold_tune_enabled:
             return

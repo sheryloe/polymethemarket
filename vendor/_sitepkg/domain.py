@@ -15,6 +15,98 @@ STRATEGY_LEGACY = "legacy"
 STRATEGY_MODEL_A = "model_a_contrarian"
 STRATEGY_MODEL_B = "model_b_ensemble"
 AB_STRATEGY_IDS = (STRATEGY_MODEL_A, STRATEGY_MODEL_B)
+EXECUTION_MODE_LEGACY = "legacy"
+EXECUTION_MODE_FUNDED_PAPER = "funded_paper"
+EXECUTION_MODE_SHADOW_PAPER = "shadow_paper"
+STRATEGY_EXPIRY_ANCHOR = "expiry_anchor_active"
+STRATEGY_TAPE_RIDER = "tape_rider_shadow"
+STRATEGY_PULSE_FADE = "pulse_fade_reserved"
+STRATEGY_PIN_MAGNET = "pin_magnet_reserved"
+
+
+@dataclass(frozen=True, slots=True)
+class StrategySpec:
+    strategy_id: str
+    display_name: str
+    execution_mode: str
+    predictor_key: str
+    direction_mode: str
+    position_usd: float
+    max_positions: int
+    enabled: bool = True
+    report_order: int = 0
+
+
+STRATEGY_REGISTRY: dict[str, StrategySpec] = {
+    STRATEGY_EXPIRY_ANCHOR: StrategySpec(
+        strategy_id=STRATEGY_EXPIRY_ANCHOR,
+        display_name="ExpiryAnchor",
+        execution_mode=EXECUTION_MODE_FUNDED_PAPER,
+        predictor_key="expiry_anchor",
+        direction_mode="direct",
+        position_usd=500.0,
+        max_positions=3,
+        report_order=1,
+    ),
+    STRATEGY_TAPE_RIDER: StrategySpec(
+        strategy_id=STRATEGY_TAPE_RIDER,
+        display_name="TapeRider",
+        execution_mode=EXECUTION_MODE_SHADOW_PAPER,
+        predictor_key="tape_rider",
+        direction_mode="direct",
+        position_usd=500.0,
+        max_positions=3,
+        report_order=2,
+    ),
+    STRATEGY_PULSE_FADE: StrategySpec(
+        strategy_id=STRATEGY_PULSE_FADE,
+        display_name="PulseFade",
+        execution_mode=EXECUTION_MODE_SHADOW_PAPER,
+        predictor_key="pulse_fade",
+        direction_mode="direct",
+        position_usd=500.0,
+        max_positions=3,
+        enabled=False,
+        report_order=3,
+    ),
+    STRATEGY_PIN_MAGNET: StrategySpec(
+        strategy_id=STRATEGY_PIN_MAGNET,
+        display_name="PinMagnet",
+        execution_mode=EXECUTION_MODE_SHADOW_PAPER,
+        predictor_key="pin_magnet",
+        direction_mode="direct",
+        position_usd=500.0,
+        max_positions=3,
+        enabled=False,
+        report_order=4,
+    ),
+}
+ACTIVE_STRATEGY_IDS = (STRATEGY_EXPIRY_ANCHOR, STRATEGY_TAPE_RIDER)
+
+
+def get_strategy_spec(strategy_id: str) -> StrategySpec:
+    return STRATEGY_REGISTRY.get(
+        strategy_id,
+        StrategySpec(
+            strategy_id=strategy_id,
+            display_name=strategy_id,
+            execution_mode=EXECUTION_MODE_LEGACY,
+            predictor_key="legacy",
+            direction_mode="direct",
+            position_usd=0.0,
+            max_positions=0,
+            enabled=False,
+        ),
+    )
+
+
+def iter_active_strategy_specs() -> tuple[StrategySpec, ...]:
+    return tuple(
+        sorted(
+            (spec for spec in STRATEGY_REGISTRY.values() if spec.enabled and spec.strategy_id in ACTIVE_STRATEGY_IDS),
+            key=lambda spec: spec.report_order,
+        )
+    )
 
 
 class Side(str, Enum):
@@ -78,6 +170,7 @@ class Signal:
     liquidity_score: float
     model_edge_score: float
     regime_score: float
+    execution_mode: str = EXECUTION_MODE_LEGACY
     model_confidence: float = 0.0
     effective_edge: float = 0.0
     created_at: datetime = field(default_factory=utcnow)
@@ -93,6 +186,7 @@ class OrderIntent:
     price: float
     size_usd: float
     mode: DecisionType
+    execution_mode: str = EXECUTION_MODE_LEGACY
     created_at: datetime = field(default_factory=utcnow)
 
 
@@ -122,6 +216,7 @@ class FillResult:
     status: str
     fee_usd: float
     mode: TradingMode
+    execution_mode: str = EXECUTION_MODE_LEGACY
     created_at: datetime = field(default_factory=utcnow)
     pnl_usd: float = 0.0
 

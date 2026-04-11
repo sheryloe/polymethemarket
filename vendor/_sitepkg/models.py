@@ -51,6 +51,7 @@ class SignalORM(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
+    execution_mode: Mapped[str] = mapped_column(String(32), index=True, default="legacy")
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     side: Mapped[str] = mapped_column(String(8))
@@ -68,6 +69,7 @@ class OrderORM(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
+    execution_mode: Mapped[str] = mapped_column(String(32), index=True, default="legacy")
     signal_id: Mapped[str] = mapped_column(String(64), index=True)
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(8))
@@ -86,6 +88,7 @@ class FillORM(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
+    execution_mode: Mapped[str] = mapped_column(String(32), index=True, default="legacy")
     order_id: Mapped[str] = mapped_column(String(64), index=True)
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(8))
@@ -102,15 +105,22 @@ class PositionORM(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
+    execution_mode: Mapped[str] = mapped_column(String(32), index=True, default="legacy")
     market_id: Mapped[str] = mapped_column(String(128), index=True)
     side: Mapped[str] = mapped_column(String(8))
     entry_price: Mapped[float] = mapped_column(Float)
     size_usd: Mapped[float] = mapped_column(Float)
+    entry_fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
     trading_mode: Mapped[str] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(16), default="open")
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    gross_realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    close_reason: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    fallback_mark_close: Mapped[bool] = mapped_column(default=False, index=True)
+    resolved_outcome_yes: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class EquityCurveORM(Base):
@@ -118,6 +128,7 @@ class EquityCurveORM(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_id: Mapped[str] = mapped_column(String(64), index=True, default="legacy")
+    execution_mode: Mapped[str] = mapped_column(String(32), index=True, default="legacy")
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     equity_usd: Mapped[float] = mapped_column(Float)
     daily_drawdown_pct: Mapped[float] = mapped_column(Float)
